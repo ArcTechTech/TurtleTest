@@ -595,6 +595,13 @@ local function runCmd(cmd, a)
         end
         return true, name and "ok" or "no block", name and { name = name }
     end
+    if cmd == "scan" then
+        -- full surroundings snapshot: up, down and all four walls
+        scanSides(true)
+        flushBlocks()
+        dirtyState = true
+        return true, "scanned surroundings"
+    end
 
     -- inventory ------------------------------------------------------------- --
     if cmd == "select" then
