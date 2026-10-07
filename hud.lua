@@ -250,16 +250,14 @@ local function scanSides(includeFrontBack)
             turtle.turnLeft()
             facing = (facing + 3) % 4
         end
-        local name = doInspect("front")
-        if name then
-            local f = FWD[facing]
-            addBlock(pos.x + f.x, pos.y, pos.z + f.z, name)
-        end
+        local f = FWD[facing]
+        -- record air as well: a rescan must be able to CORRECT cells that
+        -- changed in-world, otherwise the map drifts out of sync forever
+        addBlock(pos.x + f.x, pos.y, pos.z + f.z,
+            doInspect("front") or "minecraft:air")
     end
-    local up = doInspect("up")
-    if up then addBlock(pos.x, pos.y + 1, pos.z, up) end
-    local dn = doInspect("down")
-    if dn then addBlock(pos.x, pos.y - 1, pos.z, dn) end
+    addBlock(pos.x, pos.y + 1, pos.z, doInspect("up") or "minecraft:air")
+    addBlock(pos.x, pos.y - 1, pos.z, doInspect("down") or "minecraft:air")
     look((orig + 3) % 4)   -- left
     look((orig + 1) % 4)   -- right
     if includeFrontBack then
@@ -276,12 +274,17 @@ local function turnLeft()
     turtle.turnLeft()
     facing = (facing + 3) % 4
     dirtyState = true
+    -- whatever we now face gets recorded right away
+    local f = FWD[facing]
+    addBlock(pos.x + f.x, pos.y, pos.z + f.z, doInspect("front") or "minecraft:air")
 end
 
 local function turnRight()
     turtle.turnRight()
     facing = (facing + 1) % 4
     dirtyState = true
+    local f = FWD[facing]
+    addBlock(pos.x + f.x, pos.y, pos.z + f.z, doInspect("front") or "minecraft:air")
 end
 
 local function faceTo(dir)
@@ -318,21 +321,31 @@ local function move(dir, autoDig)
         ensureFuel()
         ok, err = turtle[dir]()
     end
-    if not ok then return false, err end
+    if not ok then
+        -- a blocked move still tells us what is there: record the obstacle,
+        -- otherwise driving into a wall never maps the wall ("front missed")
+        if dir ~= "back" then
+            local d = dir == "forward" and "front" or dir
+            local name = doInspect(d)
+            if name then
+                local tx, ty, tz = targetOf(d)
+                addBlock(tx, ty, tz, name)
+            end
+        end
+        return false, err
+    end
     updatePos(dir)
-    -- live mapping (turtle-gambit pattern): the cell we now occupy is air and
-    -- the cells down/up/ahead are recorded on every move, not only in jobs -
-    -- so travel, goto and manual driving all grow the server-side map.
+    -- live mapping (gambit pattern): the occupied cell and the cells
+    -- down/up/ahead are recorded on every move - as solids OR air - so
+    -- travel, goto and manual driving all grow/correct the server-side map.
     addBlock(pos.x, pos.y, pos.z, "minecraft:air")
     local dn = doInspect("down")
-    if dn then addBlock(pos.x, pos.y - 1, pos.z, dn) end
+    addBlock(pos.x, pos.y - 1, pos.z, dn or "minecraft:air")
     local upHere = doInspect("up")
-    if upHere then addBlock(pos.x, pos.y + 1, pos.z, upHere) end
+    addBlock(pos.x, pos.y + 1, pos.z, upHere or "minecraft:air")
     local fw = doInspect("front")
-    if fw then
-        local f = FWD[facing]
-        addBlock(pos.x + f.x, pos.y, pos.z + f.z, fw)
-    end
+    local f = FWD[facing]
+    addBlock(pos.x + f.x, pos.y, pos.z + f.z, fw or "minecraft:air")
     return true
 end
 
@@ -596,7 +609,10 @@ local function runCmd(cmd, a)
         return true, name and "ok" or "no block", name and { name = name }
     end
     if cmd == "scan" then
-        -- full surroundings snapshot: up, down and all four walls
+        -- full surroundings snapshot: up, down and all four walls.
+        -- forget what we already reported so EVERY cell is re-sent -
+        -- this also fixes rescanning after "clear map" on the dashboard
+        seen, seenCount = {}, 0
         scanSides(true)
         flushBlocks()
         dirtyState = true
