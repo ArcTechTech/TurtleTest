@@ -5,7 +5,7 @@
 -- Persist:   wget <server>/hud.lua?token=<token> startup
 -- Run:       hud [name]
 
-local WS_URL = "wss://desktop-09fqktu.tail9a2d18.ts.net:8443/turtle"
+local WS_URL = "wss://bailey-brother-rankings-liability.trycloudflare.com/turtle"
 local TOKEN = "447004d3aa68ca41"
 
 local args = { ... }
@@ -235,7 +235,10 @@ local function digBlock(dir)
         if before then addBlock(tx, ty, tz, before) end
     end
     local ok, err = digFn(dir)()
-    if ok and scanned then addBlock(tx, ty, tz, "minecraft:air") end
+    if ok then
+        dirtyState = true
+        if scanned then addBlock(tx, ty, tz, "minecraft:air") end
+    end
     return ok, err
 end
 
@@ -317,6 +320,19 @@ local function move(dir, autoDig)
     end
     if not ok then return false, err end
     updatePos(dir)
+    -- live mapping (turtle-gambit pattern): the cell we now occupy is air and
+    -- the cells down/up/ahead are recorded on every move, not only in jobs -
+    -- so travel, goto and manual driving all grow the server-side map.
+    addBlock(pos.x, pos.y, pos.z, "minecraft:air")
+    local dn = doInspect("down")
+    if dn then addBlock(pos.x, pos.y - 1, pos.z, dn) end
+    local upHere = doInspect("up")
+    if upHere then addBlock(pos.x, pos.y + 1, pos.z, upHere) end
+    local fw = doInspect("front")
+    if fw then
+        local f = FWD[facing]
+        addBlock(pos.x + f.x, pos.y, pos.z + f.z, fw)
+    end
     return true
 end
 
@@ -859,7 +875,9 @@ local function reader()
             if not flushOutbox() then return end
         elseif e == "timer" and ev[2] == timer then
             tick = tick + 1
-            if tick % 2 == 0 then pushState() end
+            -- push state when something changed (<=1s latency while moving),
+            -- plus a 10s heartbeat even when idle
+            if dirtyState or tick % 10 == 0 then pushState() end
             flushBlocks()
             if not flushOutbox() then return end
             renderScreen()
