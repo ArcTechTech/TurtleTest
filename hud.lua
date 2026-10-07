@@ -5,7 +5,7 @@
 -- Persist:   wget <server>/hud.lua?token=<token> startup
 -- Run:       hud [name]
 
-local WS_URL = "wss://bailey-brother-rankings-liability.trycloudflare.com/turtle"
+local WS_URL = "wss://tablets-members-cos-drawn.trycloudflare.com/turtle"
 local TOKEN = "447004d3aa68ca41"
 
 local args = { ... }
