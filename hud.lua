@@ -273,18 +273,21 @@ end
 local function turnLeft()
     turtle.turnLeft()
     facing = (facing + 3) % 4
-    dirtyState = true
-    -- whatever we now face gets recorded right away
+    -- record what we now face and push the new heading to the dashboard
+    -- immediately (waiting on the 1s state tick made turns feel laggy)
     local f = FWD[facing]
     addBlock(pos.x + f.x, pos.y, pos.z + f.z, doInspect("front") or "minecraft:air")
+    flushBlocks()
+    pushState()
 end
 
 local function turnRight()
     turtle.turnRight()
     facing = (facing + 1) % 4
-    dirtyState = true
     local f = FWD[facing]
     addBlock(pos.x + f.x, pos.y, pos.z + f.z, doInspect("front") or "minecraft:air")
+    flushBlocks()
+    pushState()
 end
 
 local function faceTo(dir)
@@ -346,6 +349,10 @@ local function move(dir, autoDig)
     local fw = doInspect("front")
     local f = FWD[facing]
     addBlock(pos.x + f.x, pos.y, pos.z + f.z, fw or "minecraft:air")
+    -- move telemetry leaves instantly: queued blocks + state flush right
+    -- here instead of waiting for the reader's 1s tick
+    flushBlocks()
+    pushState()
     return true
 end
 
