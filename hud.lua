@@ -42,6 +42,48 @@ local pendingNames = {}               -- name -> index in current batch
 local seen = {}                       -- "x,y,z" -> name (skip re-inspect)
 local seenCount = 0
 local oreTargets = {}                 -- "x,y,z" -> {x,y,z} autoMine detours
+local gcur = { layer = 0, lane = 0, cell = 0 }  -- autoMine grid cursor
+
+-- local persistence: keep home / odometer / grid cursor on disk so a crash,
+-- reboot or re-install doesn't force a recalibrate + sethome every time ------
+local SAVE_PATH = "/.turtle_hud_state"
+local function saveLocal()
+    pcall(function()
+        local f = fs.open(SAVE_PATH, "w")
+        if not f then return end
+        f.write(textutils.serializeJSON({
+            pos = { x = pos.x, y = pos.y, z = pos.z },
+            facing = facing, known = known, home = home, grid = gcur,
+        }))
+        f.close()
+    end)
+end
+local function loadLocal()
+    pcall(function()
+        local f = fs.open(SAVE_PATH, "r")
+        if not f then return end
+        local raw = f.readAll()
+        f.close()
+        local s = raw and textutils.unserializeJSON(raw)
+        if type(s) ~= "table" then return end
+        if type(s.pos) == "table" then
+            pos = { x = tonumber(s.pos.x) or pos.x,
+                    y = tonumber(s.pos.y) or pos.y,
+                    z = tonumber(s.pos.z) or pos.z }
+        end
+        if tonumber(s.facing) then facing = tonumber(s.facing) % 4 end
+        known = s.known == true or known
+        local h = type(s.home) == "table" and s.home or nil
+        if h and tonumber(h.x) and tonumber(h.y) and tonumber(h.z) then
+            home = { x = tonumber(h.x), y = tonumber(h.y), z = tonumber(h.z) }
+        end
+        if type(s.grid) == "table" then
+            gcur = { layer = tonumber(s.grid.layer) or gcur.layer,
+                     lane = tonumber(s.grid.lane) or gcur.lane,
+                     cell = tonumber(s.grid.cell) or gcur.cell }
+        end
+    end)
+end
 
 -- forward declarations -------------------------------------------------------
 local flushBlocks
@@ -110,7 +152,7 @@ flushBlocks = function()
     push({ t = "blocks", names = names, add = add })
 end
 
---- Ore heuristic (vanilla â€¦_ore plus modded names that contain "ore").
+--- Ore heuristic (vanilla …_ore plus modded names that contain "ore").
 local function isOreName(n)
     if type(n) ~= "string" then return false end
     local base = n:match("([^:]+)$") or n
@@ -694,11 +736,13 @@ local function runCmd(cmd, a)
             if f then facing = f % 4 end
         end
         dirtyState = true
+        saveLocal()
         return true, string.format("calibrated %d,%d,%d", x, y, z)
     end
     if cmd == "sethome" then
         home = { x = pos.x, y = pos.y, z = pos.z }
         dirtyState = true
+        saveLocal()
         return true, "home set"
     end
     if cmd == "home" then
@@ -791,14 +835,17 @@ local function runCmd(cmd, a)
         return true, string.format("mined %dx%dx%d", w, l, depth)
     end
 
-    -- auto mining: tunnel forward, chase ores, home when the bag is full --- --
+    -- auto mining: grid around home, chase ores, home when the bag is full - --
     if cmd == "autoMine" then
         if not home then
-            return false, "set home first (sethome or calibrate)"
+            return false, "set home first (sethome)"
         end
         local tall = a.tall ~= false
         scanMode = a.scan or "walls"
+        local span = tonumber(a.span) or 15    -- half-width of the grid box
+        if span < 1 then span = 1 elseif span > 64 then span = 64 end
         local steps = 0
+        local fails = 0
         -- fresh detection only: old sightings may long be mined out
         oreTargets = {}
         local function full()
@@ -818,7 +865,48 @@ local function runCmd(cmd, a)
             end
             return bx, by, bz
         end
-        log("auto-mine: dig until full, ores first, then home", "ok")
+        -- serpentine lanes centred on home: lane k runs east on even k and
+        -- west on odd k while z zig-zags, y walks its own zig-zag per layer,
+        -- so the turtle always grinds a box around home instead of one long
+        -- tunnel that wanders out of loaded chunks (which freezes the turtle
+        -- and drops the websocket)
+        local LAYERY = { 0, -1, 1, -2, 2 }
+        local function zig(m)
+            if m == 0 then return 0 end
+            local s = math.ceil(m / 2)
+            if m % 2 == 1 then return s end
+            return -s
+        end
+        local function patternCell()
+            local g = gcur
+            local x
+            if g.lane % 2 == 1 then
+                x = home.x + span - g.cell
+            else
+                x = home.x - span + g.cell
+            end
+            return x, home.y + (LAYERY[g.layer + 1] or 0),
+                   home.z + zig(g.lane)
+        end
+        local function advance()
+            local g = gcur
+            g.cell = g.cell + 1
+            if g.cell > span * 2 then
+                g.cell = 0
+                g.lane = g.lane + 1
+                if g.lane > span * 2 then
+                    g.lane = 0
+                    g.layer = g.layer + 1
+                    if g.layer >= #LAYERY then
+                        g.layer = 0
+                        log("auto-mine: grid covered - restarting pattern",
+                            "info")
+                    end
+                end
+            end
+            dirtyState = true
+        end
+        log("auto-mine: grid around home, ores first, then home", "ok")
         while true do
             checkStop()
             -- top up fuel every lap (refuel no-ops once above target)
@@ -854,14 +942,34 @@ local function runCmd(cmd, a)
                     log("ore unreachable: " .. tostring(errOre), "warn")
                 end
             else
-                status = "autoMine: tunneling"
-                dirtyState = true
-                moveStrict("forward")
-                if tall then digBlock("up") end
-                steps = steps + 1
-                -- peek around the side walls for embedded ores
-                if scanMode ~= "off" and steps % 4 == 3 then
-                    scanSides(false)
+                local tx, ty, tz = patternCell()
+                if pos.x == tx and pos.y == ty and pos.z == tz then
+                    -- standing in the pattern cell: clear it, scan, advance
+                    status = "autoMine: grid mining"
+                    dirtyState = true
+                    fails = 0
+                    if tall then digBlock("up") end
+                    steps = steps + 1
+                    -- peek around the side walls for embedded ores
+                    if scanMode ~= "off" and steps % 4 == 3 then
+                        scanSides(false)
+                    end
+                    advance()
+                else
+                    status = "autoMine: grid walking"
+                    dirtyState = true
+                    local okM, errM = pcall(goTo, tx, ty, tz)
+                    if okM then
+                        fails = 0
+                    else
+                        -- unbreakable cell: skip it, but bail out instead of
+                        -- spinning in place if the pattern can't progress
+                        fails = fails + 1
+                        if fails > 4 then
+                            return false, "grid blocked: " .. tostring(errM)
+                        end
+                        advance()
+                    end
                 end
             end
         end
@@ -1002,7 +1110,10 @@ local function reader()
             tick = tick + 1
             -- push state when something changed (<=1s latency while moving),
             -- plus a 10s heartbeat even when idle
-            if dirtyState or tick % 10 == 0 then pushState() end
+            if dirtyState or tick % 10 == 0 then
+                pushState()
+                saveLocal()
+            end
             flushBlocks()
             if not flushOutbox() then return end
             renderScreen()
@@ -1098,6 +1209,7 @@ local function session()
 end
 
 -- --------------------------------------------------------------------- run --
+loadLocal()
 print("Turtle HUD starting...")
 print("server: " .. WS_URL)
 
