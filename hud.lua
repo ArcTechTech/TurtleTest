@@ -5,8 +5,8 @@
 -- Persist:   wget <server>/hud.lua?token=<token> startup
 -- Run:       hud [name]
 
-local WS_URL = "__URL__"
-local TOKEN = "__TOKEN__"
+local WS_URL = "wss://desktop-09fqktu.tail9a2d18.ts.net:8443/turtle"
+local TOKEN = "447004d3aa68ca41"
 
 local args = { ... }
 local CID = os.getComputerID()
