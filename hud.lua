@@ -41,6 +41,7 @@ local pending = {}                    -- {x,y,z,nameIndex} batches
 local pendingNames = {}               -- name -> index in current batch
 local seen = {}                       -- "x,y,z" -> name (skip re-inspect)
 local seenCount = 0
+local oreTargets = {}                 -- "x,y,z" -> {x,y,z} autoMine detours
 
 -- forward declarations -------------------------------------------------------
 local flushBlocks
@@ -109,6 +110,13 @@ flushBlocks = function()
     push({ t = "blocks", names = names, add = add })
 end
 
+--- Ore heuristic (vanilla â€¦_ore plus modded names that contain "ore").
+local function isOreName(n)
+    if type(n) ~= "string" then return false end
+    local base = n:match("([^:]+)$") or n
+    return base:find("ore", 1, true) ~= nil
+end
+
 local function addBlock(x, y, z, name)
     if not name then return end
     local key = bkey(x, y, z)
@@ -116,6 +124,14 @@ local function addBlock(x, y, z, name)
     seen[key] = name
     seenCount = seenCount + 1
     if seenCount > 40000 then seen, seenCount = {}, 0 end
+    -- auto-mine bookkeeping: a fresh ore sighting becomes a detour target,
+    -- and a cell corrected away from ore (mined or re-scanned) drops its own
+    if oreTargets[key] then
+        if not isOreName(name) then oreTargets[key] = nil end
+    elseif isOreName(name) then
+        oreTargets[key] = { x = math.floor(x), y = math.floor(y),
+            z = math.floor(z) }
+    end
     local ni = pendingNames[name]
     if not ni then
         ni = #pendingNames + 1
@@ -333,6 +349,9 @@ local function move(dir, autoDig)
             if name then
                 local tx, ty, tz = targetOf(d)
                 addBlock(tx, ty, tz, name)
+                -- flush NOW: if a higher layer errors right after this,
+                -- queued blocks would otherwise ride along unflushed
+                flushBlocks()
             end
         end
         return false, err
@@ -772,6 +791,82 @@ local function runCmd(cmd, a)
         return true, string.format("mined %dx%dx%d", w, l, depth)
     end
 
+    -- auto mining: tunnel forward, chase ores, home when the bag is full --- --
+    if cmd == "autoMine" then
+        if not home then
+            return false, "set home first (sethome or calibrate)"
+        end
+        local tall = a.tall ~= false
+        scanMode = a.scan or "walls"
+        local steps = 0
+        -- fresh detection only: old sightings may long be mined out
+        oreTargets = {}
+        local function full()
+            for i = 1, 16 do
+                if not turtle.getItemDetail(i) then return false end
+            end
+            return true
+        end
+        local function nearestOre()
+            local bx, by, bz, bd
+            for _, c in pairs(oreTargets) do
+                local d = math.abs(c.x - pos.x) + math.abs(c.y - pos.y)
+                    + math.abs(c.z - pos.z)
+                if not bd or d < bd then
+                    bx, by, bz, bd = c.x, c.y, c.z, d
+                end
+            end
+            return bx, by, bz
+        end
+        log("auto-mine: dig until full, ores first, then home", "ok")
+        while true do
+            checkStop()
+            -- top up fuel every lap (refuel no-ops once above target)
+            pcall(runCmd, "refuel", { min = 64 })
+            if full() then
+                flushBlocks()
+                log("auto-mine: inventory full - heading home", "warn")
+                status = "autoMine: homing"
+                dirtyState = true
+                local dist = math.abs(home.x - pos.x)
+                    + math.abs(home.y - pos.y) + math.abs(home.z - pos.z) + 16
+                pcall(runCmd, "refuel", { min = dist })
+                goTo(home.x, home.y, home.z)
+                scanMode = "off"
+                flushBlocks()
+                pushState()
+                return true, string.format("full - homed at %d,%d,%d",
+                    pos.x, pos.y, pos.z)
+            end
+            local ox, oy, oz = nearestOre()
+            if ox then
+                status = "autoMine: chasing ore"
+                dirtyState = true
+                -- goTo digs through everything; landing inside the ore cell
+                -- is what actually mines the ore block
+                local okOre, errOre = pcall(goTo, ox, oy, oz)
+                if okOre then
+                    -- we occupy that cell now, so it is air by definition;
+                    -- recording it clears the target and corrects the map
+                    addBlock(ox, oy, oz, "minecraft:air")
+                else
+                    oreTargets[bkey(ox, oy, oz)] = nil
+                    log("ore unreachable: " .. tostring(errOre), "warn")
+                end
+            else
+                status = "autoMine: tunneling"
+                dirtyState = true
+                moveStrict("forward")
+                if tall then digBlock("up") end
+                steps = steps + 1
+                -- peek around the side walls for embedded ores
+                if scanMode ~= "off" and steps % 4 == 3 then
+                    scanSides(false)
+                end
+            end
+        end
+    end
+
     -- dumping --------------------------------------------------------------- --
     if cmd == "dump" then
         local dir = resolveDir(a.dir)
@@ -945,7 +1040,10 @@ local function worker()
             dirtyState = true
             renderScreen()
             if not ok then
-                log(tostring(job.cmd) .. ": " .. tostring(msg), "error")
+                -- bumping a wall while driving is normal feedback, not a crash
+                local lvl = tostring(msg):find("obstruct", 1, true)
+                    and "warn" or "error"
+                log(tostring(job.cmd) .. ": " .. tostring(msg), lvl)
             end
         else
             sleep(0.1)
@@ -1014,6 +1112,10 @@ while true do
     if ws then pcall(ws.close) end
     ws = nil
     outbox = {}
+    -- cells queued at disconnect died with the outbox; forget what we
+    -- "reported" so the next session re-sends them instead of skipping
+    -- them forever (this was why bumped walls sometimes never rendered)
+    seen, seenCount = {}, 0
     if not ok then
         status = "reconnecting"
         printError(tostring(err))
