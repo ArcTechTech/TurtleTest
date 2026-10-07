@@ -925,8 +925,10 @@ end
 
 -- ----------------------------------------------------------------- session --
 local function waitForWelcome()
-    push({ t = "hello", token = TOKEN, name = NAME, cid = CID, ver = 1 })
-    if not flushOutbox() then error("send failed") end
+    -- send hello directly so it is always the first frame on the wire,
+    -- ahead of any queued log lines (those flush once reader() starts)
+    ws.send(textutils.serializeJSON(
+        { t = "hello", token = TOKEN, name = NAME, cid = CID, ver = 1 }))
     local timer = os.startTimer(15)
     while true do
         local ev = { os.pullEvent() }
