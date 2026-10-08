@@ -1111,7 +1111,7 @@ local function runCmd(cmd, a)
         local function advance()
             local g = fcur
             g.cell = g.cell + 1
-            if g.cell > w then
+            if g.cell >= w then
                 g.cell = 0
                 g.lane = g.lane + 1
                 if g.lane >= l then
