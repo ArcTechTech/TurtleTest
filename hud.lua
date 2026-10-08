@@ -5,7 +5,12 @@
 -- Persist:   wget <server>/hud.lua?token=<token> startup
 -- Run:       hud [name]
 
-local WS_URL = "wss://juan-verse-produce-fridge.trycloudflare.com/turtle"
+-- endpoint list: primary first (cloudflare quick tunnel - its url rotates on
+-- every restart) then the permanent tailscale funnel. the reconnect loop
+-- rotates through this list, so a tunnel restart never needs a reinstall.
+local WS_URLS = { "https://christopher-powerful-psychology-hitting.trycloudflare.com/turtle",
+    "wss://desktop-09fqktu.tail9a2d18.ts.net:8443/turtle" }
+local WS_URL = WS_URLS[1]
 local TOKEN = "447004d3aa68ca41"
 
 local args = { ... }
@@ -1213,6 +1218,7 @@ loadLocal()
 print("Turtle HUD starting...")
 print("server: " .. WS_URL)
 
+local urlIdx = 1
 local backoff = 1
 while true do
     status = "connecting"
@@ -1232,10 +1238,16 @@ while true do
         status = "reconnecting"
         printError(tostring(err))
         log("disconnected: " .. tostring(err), "error")
+        -- rotate endpoints: when the quick tunnel is dead its url has
+        -- changed, so the next attempt goes through the permanent funnel
+        urlIdx = urlIdx % #WS_URLS + 1
+        WS_URL = WS_URLS[urlIdx]
         renderScreen()
         sleep(backoff)
         backoff = math.min(backoff * 2, 10)
     else
+        urlIdx = 1
+        WS_URL = WS_URLS[urlIdx]
         backoff = 1
         sleep(0.5)
     end
