@@ -8,7 +8,7 @@
 -- endpoint list: primary first (cloudflare quick tunnel - its url rotates on
 -- every restart) then the permanent tailscale funnel. the reconnect loop
 -- rotates through this list, so a tunnel restart never needs a reinstall.
-local WS_URLS = { "https://preference-hear-steam-colors.trycloudflare.com/turtle",
+local WS_URLS = { "https://testimonials-covers-bridge-laden.trycloudflare.com/turtle",
     "wss://desktop-09fqktu.tail9a2d18.ts.net:8443/turtle" }
 local WS_URL = WS_URLS[1]
 local TOKEN = "447004d3aa68ca41"
