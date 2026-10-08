@@ -8,7 +8,7 @@
 -- endpoint list: primary first (cloudflare quick tunnel - its url rotates on
 -- every restart) then the permanent tailscale funnel. the reconnect loop
 -- rotates through this list, so a tunnel restart never needs a reinstall.
-local WS_URLS = { "https://workshop-fancy-coat-appearing.trycloudflare.com/turtle",
+local WS_URLS = { "https://api.trycloudflare.com/turtle",
     "wss://desktop-09fqktu.tail9a2d18.ts.net:8443/turtle" }
 local WS_URL = WS_URLS[1]
 local TOKEN = "447004d3aa68ca41"
@@ -48,6 +48,9 @@ local seen = {}                       -- "x,y,z" -> name (skip re-inspect)
 local seenCount = 0
 local oreTargets = {}                 -- "x,y,z" -> {x,y,z} autoMine detours
 local gcur = { layer = 0, lane = 0, cell = 0 }  -- autoMine grid cursor
+local farmA = nil                    -- farm corner A {x,y,z} (setfarm, click 1)
+local farmB = nil                    -- opposite farm corner (setfarm, click 2)
+local fcur = { lane = 0, cell = 0 }  -- farm walk cursor
 
 -- local persistence: keep home / odometer / grid cursor on disk so a crash,
 -- reboot or re-install doesn't force a recalibrate + sethome every time ------
@@ -59,6 +62,7 @@ local function saveLocal()
         f.write(textutils.serializeJSON({
             pos = { x = pos.x, y = pos.y, z = pos.z },
             facing = facing, known = known, home = home, grid = gcur,
+            farmA = farmA, farmB = farmB, fcur = fcur,
         }))
         f.close()
     end)
@@ -86,6 +90,18 @@ local function loadLocal()
             gcur = { layer = tonumber(s.grid.layer) or gcur.layer,
                      lane = tonumber(s.grid.lane) or gcur.lane,
                      cell = tonumber(s.grid.cell) or gcur.cell }
+        end
+        local function loadCorner(v)
+            if type(v) ~= "table" then return nil end
+            local x, y, z = tonumber(v.x), tonumber(v.y), tonumber(v.z)
+            if not (x and y and z) then return nil end
+            return { x = x, y = y, z = z }
+        end
+        farmA = loadCorner(s.farmA) or farmA
+        farmB = loadCorner(s.farmB) or farmB
+        if type(s.fcur) == "table" then
+            fcur = { lane = tonumber(s.fcur.lane) or 0,
+                     cell = tonumber(s.fcur.cell) or 0 }
         end
     end)
 end
@@ -750,6 +766,28 @@ local function runCmd(cmd, a)
         saveLocal()
         return true, "home set"
     end
+    if cmd == "setfarm" then
+        local here = { x = pos.x, y = pos.y, z = pos.z }
+        if not farmA or farmB then
+            -- first click (or restart after both corners were set)
+            farmA, farmB = here, nil
+            fcur = { lane = 0, cell = 0 }
+            dirtyState = true
+            saveLocal()
+            return true, string.format(
+                "farm corner A at %d,%d,%d - drive to the opposite corner and setfarm again",
+                here.x, here.y, here.z)
+        end
+        -- second click: the marked rectangle is the whole field
+        farmB = here
+        fcur = { lane = 0, cell = 0 }
+        dirtyState = true
+        saveLocal()
+        local w = math.abs(farmB.x - farmA.x) + 1
+        local l = math.abs(farmB.z - farmA.z) + 1
+        return true, string.format("field %dx%d marked (%d,%d)-(%d,%d)",
+            w, l, farmA.x, farmA.z, farmB.x, farmB.z)
+    end
     if cmd == "home" then
         if not home then return false, "no home set" end
         goTo(home.x, home.y, home.z)
@@ -976,6 +1014,241 @@ local function runCmd(cmd, a)
                         advance()
                     end
                 end
+            end
+        end
+    end
+
+    -- farming: harvest mature crops + replant, strictly inside the marked field
+    if cmd == "farm" then
+        if not farmA or not farmB then
+            return false, "mark the field first (setfarm at both corners)"
+        end
+        if not home then
+            return false, "set home first (sethome)"
+        end
+        scanMode = "off"
+        -- normalized bounds: corners are the crop layer, order independent
+        local x1 = math.min(farmA.x, farmB.x)
+        local x2 = math.max(farmA.x, farmB.x)
+        local z1 = math.min(farmA.z, farmB.z)
+        local z2 = math.max(farmA.z, farmB.z)
+        local y = farmA.y                    -- crop layer (stands on farmland)
+        local py = y + 1                     -- path layer, one above the crops
+        local w, l = x2 - x1 + 1, z2 - z1 + 1
+        if fcur.cell >= w or fcur.lane >= l then
+            fcur = { lane = 0, cell = 0 }    -- field shrank / new mark: restart
+        end
+        local harvested, planted, missed, laps = 0, 0, 0, 0
+        local fails = 0
+        -- maturity per known crop; unknown age crops default to max 7
+        local CROP_MAX = {
+            ["minecraft:wheat"] = 7,
+            ["minecraft:carrots"] = 7,
+            ["minecraft:potatoes"] = 7,
+            ["minecraft:beetroot"] = 3,
+            ["minecraft:nether_wart"] = 3,
+        }
+        local SEEDY = { ["minecraft:carrots"] = true,
+                        ["minecraft:potatoes"] = true }
+        local function isCrop(info)
+            if type(info) ~= "table" then return false end
+            local st = type(info.state) == "table" and info.state or {}
+            return tonumber(st.age) ~= nil or CROP_MAX[info.name] ~= nil
+        end
+        local function full()
+            for i = 1, 16 do
+                if not turtle.getItemDetail(i) then return false end
+            end
+            return true
+        end
+        -- exact seed for a harvested crop, else nil (never cross-plant)
+        local function seedSlot(crop)
+            local want
+            if SEEDY[crop] then
+                want = crop                      -- carrots/potatoes plant as-is
+            elseif crop == "minecraft:wheat" then
+                want = "minecraft:wheat_seeds"
+            elseif crop == "minecraft:beetroot" then
+                want = "minecraft:beetroot_seeds"
+            else
+                want = crop .. "_seeds"          -- modded convention
+            end
+            for i = 1, 16 do
+                local d = turtle.getItemDetail(i)
+                if d and d.name == want then return i end
+            end
+            return nil
+        end
+        -- any plantable we carry: fills bare soil with whatever we have
+        local function anySeed()
+            for i = 1, 16 do
+                local d = turtle.getItemDetail(i)
+                if d and (d.name:find("_seeds$") or SEEDY[d.name]) then
+                    return i
+                end
+            end
+            return nil
+        end
+        -- seed item -> the block it grows into (map stays honest)
+        local function cropOf(seedName)
+            if seedName == "minecraft:wheat_seeds" then return "minecraft:wheat" end
+            if seedName == "minecraft:beetroot_seeds" then return "minecraft:beetroot" end
+            if seedName:find("_seeds$") then
+                return (seedName:gsub("_seeds$", ""))
+            end
+            return seedName                     -- carrots / potatoes
+        end
+        local function farmCell()
+            local g = fcur
+            if g.cell >= w or g.lane >= l then  -- field re-marked mid-job
+                fcur = { lane = 0, cell = 0 }
+                g = fcur
+            end
+            local cx
+            if g.lane % 2 == 1 then cx = x2 - g.cell else cx = x1 + g.cell end
+            return cx, z1 + g.lane
+        end
+        local function advance()
+            local g = fcur
+            g.cell = g.cell + 1
+            if g.cell > w then
+                g.cell = 0
+                g.lane = g.lane + 1
+                if g.lane >= l then
+                    g.lane = 0
+                    laps = laps + 1
+                    log(string.format("farm: lap %d done (%d harvested, %d planted)",
+                        laps, harvested, planted), "info")
+                end
+            end
+            dirtyState = true
+        end
+        -- walk above the field without digging: a roof or stray block gets
+        -- reported (map + clear error), never chewed through
+        local function flyTo(x, y, z)
+            while pos.y ~= y do
+                local dy = y > pos.y and 1 or -1
+                if not move(dy > 0 and "up" or "down", false) then
+                    return false, "field path blocked at " ..
+                        bkey(pos.x, pos.y + dy, pos.z)
+                end
+            end
+            while pos.x ~= x do
+                local dx = x > pos.x and 1 or -1
+                faceTo(dx > 0 and 1 or 3)
+                if not move("forward", false) then
+                    local f = FWD[facing]
+                    return false, "field path blocked at " ..
+                        bkey(pos.x + f.x, pos.y, pos.z + f.z)
+                end
+            end
+            while pos.z ~= z do
+                local dz = z > pos.z and 1 or -1
+                faceTo(dz > 0 and 2 or 0)
+                if not move("forward", false) then
+                    local f = FWD[facing]
+                    return false, "field path blocked at " ..
+                        bkey(pos.x + f.x, pos.y, pos.z + f.z)
+                end
+            end
+            return true
+        end
+        -- reach the field: the y leg runs wherever the turtle currently is,
+        -- then the horizontal legs run on the path layer (above the crops)
+        local okP, errP = pcall(goTo, x1, py, z1)
+        if not okP then
+            return false, "cannot reach the field: " .. tostring(errP)
+        end
+        local hasC, corner = turtle.inspectDown()
+        if hasC and not isCrop(corner) then
+            return false, string.format(
+                "corner is %s, not a field (mark corners on the crops/soil)",
+                tostring(corner.name))
+        end
+        log(string.format("farm: %dx%d field at %d,%d - harvest mature, replant",
+            w, l, x1, z1), "ok")
+        while true do
+            checkStop()
+            pcall(runCmd, "refuel", { min = 64 })
+            if full() then
+                flushBlocks()
+                log("farm: inventory full - heading home", "warn")
+                status = "farm: homing"
+                dirtyState = true
+                local dist = math.abs(home.x - pos.x) + math.abs(home.y - pos.y)
+                    + math.abs(home.z - pos.z) + 16
+                pcall(runCmd, "refuel", { min = dist })
+                goTo(home.x, home.y, home.z)
+                scanMode = "off"
+                flushBlocks()
+                pushState()
+                return true, string.format(
+                    "full - homed at %d,%d,%d (harvested %d, planted %d)",
+                    pos.x, pos.y, pos.z, harvested, planted)
+            end
+            local cx, cz = farmCell()
+            local okG, errG = flyTo(cx, py, cz)
+            if okG then
+                fails = 0
+                local has, info = turtle.inspectDown()
+                if has and isCrop(info) then
+                    local st = type(info.state) == "table" and info.state or {}
+                    local age = tonumber(st.age)
+                    local maxAge = CROP_MAX[info.name]
+                    local mature
+                    if age == nil then
+                        mature = maxAge ~= nil       -- no age state = ready
+                    else
+                        mature = age >= (maxAge or 7)
+                    end
+                    if mature then
+                        local slot = seedSlot(info.name)
+                        if slot then
+                            -- only take what we can put back: never strip a
+                            -- crop we carry no seed for
+                            status = "farm: harvesting"
+                            dirtyState = true
+                            if turtle.digDown() then
+                                harvested = harvested + 1
+                                addBlock(cx, y, cz, "minecraft:air")
+                            end
+                            turtle.select(slot)
+                            if turtle.placeDown() then
+                                planted = planted + 1
+                                addBlock(cx, y, cz, info.name)
+                            else
+                                missed = missed + 1
+                            end
+                        else
+                            missed = missed + 1   -- out of seeds: leave standing
+                        end
+                    else
+                        status = "farm: watching crops"
+                        dirtyState = true
+                    end
+                elseif not has then
+                    -- bare crop cell: plant it if the soil below accepts
+                    local slot = anySeed()
+                    if slot then
+                        local d = turtle.getItemDetail(slot)
+                        turtle.select(slot)
+                        if turtle.placeDown() then
+                            planted = planted + 1
+                            addBlock(cx, y, cz, cropOf(d.name))
+                        end
+                        status = "farm: planting"
+                        dirtyState = true
+                    end
+                end
+                -- anything else (stone, water, path) is left alone
+                flushBlocks()
+                advance()
+            else
+                fails = fails + 1
+                if fails > 4 then
+                    return false, "field blocked: " .. tostring(errG)
+                end
+                advance()
             end
         end
     end
