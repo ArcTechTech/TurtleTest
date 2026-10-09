@@ -9,7 +9,7 @@
 -- tunnel gets a new url, so when dials keep failing the reconnect loop
 -- re-reads that file and adopts the endpoint it carries now. everything
 -- runs on github + the auto-managed cloudflare tunnel, nothing else.
-local WS_URLS = { "wss://traveler-examined-cartridges-introduces.trycloudflare.com/turtle" }
+local WS_URLS = { "wss://campaigns-yang-thumbzilla-drives.trycloudflare.com/turtle" }
 local WS_URL = WS_URLS[1]
 local GITHUB_SRC =
     "https://raw.githubusercontent.com/ArcTechTech/TurtleTest/main/hud.lua"
@@ -184,6 +184,11 @@ end
 
 local function addBlock(x, y, z, name)
     if not name then return end
+    -- never bake another turtle into the block map: a peer is a moving
+    -- obstacle, not terrain (recording it left phantom turtle walls and
+    -- poisoned autoMine's pathing). filtered centrally so every call site
+    -- - move telemetry, scanSides, bump-records - is covered at once.
+    if name:find("computercraft:turtle", 1, true) then return end
     local key = bkey(x, y, z)
     if seen[key] == name then return end
     seen[key] = name
@@ -307,6 +312,14 @@ local function doInspect(dir)
     return nil
 end
 
+--- Is another turtle occupying the cell in `dir`? A peer is a moving
+--- obstacle: never dig it (that is how one autoMiner wrecked another) and
+--- never bake it into the block map (filtered centrally in addBlock too).
+local function peerInDir(dir)
+    local name = doInspect(dir)
+    return name ~= nil and name:find("computercraft:turtle", 1, true) ~= nil
+end
+
 --- Break the block in `dir`; records what was there and marks the cell air.
 local function digBlock(dir)
     local scanned = scanMode ~= "off"
@@ -397,17 +410,35 @@ local function move(dir, autoDig)
     checkStop()
     ensureFuel()
     local ok, err = turtle[dir]()
-    -- CC reports a blocked path as "Movement obstructed"
-    if not ok and autoDig and dir ~= "back" and err and
-        tostring(err):lower():find("obstruct", 1, true) then
-        digBlock(dir == "forward" and "front" or dir)
-        checkStop()
-        ensureFuel()
-        ok, err = turtle[dir]()
+    if not ok and dir ~= "back" then
+        local d = dir == "forward" and "front" or dir
+        if peerInDir(d) then
+            -- another turtle is in the way: never dig a peer - wait for it
+            -- to clear (peers are moving), and if it stays fail cleanly so
+            -- the job skips the cell instead of tearing the peer apart
+            local waited = 0
+            while peerInDir(d) and waited < 3 do
+                sleep(0.5)
+                waited = waited + 0.5
+                checkStop()
+            end
+            if peerInDir(d) then
+                return false, "blocked by another turtle"
+            end
+            ok, err = turtle[dir]()          -- peer moved off, try again
+        elseif autoDig and err and
+            tostring(err):lower():find("obstruct", 1, true) then
+            -- CC reports a blocked path as "Movement obstructed"
+            digBlock(d)
+            checkStop()
+            ensureFuel()
+            ok, err = turtle[dir]()
+        end
     end
     if not ok then
         -- a blocked move still tells us what is there: record the obstacle,
         -- otherwise driving into a wall never maps the wall ("front missed")
+        -- (addBlock filters peer turtles, so they never land on the map)
         if dir ~= "back" then
             local d = dir == "forward" and "front" or dir
             local name = doInspect(d)
@@ -790,6 +821,13 @@ local function runCmd(cmd, a)
         return true, string.format("field %dx%d marked (%d,%d)-(%d,%d)",
             w, l, farmA.x, farmA.z, farmB.x, farmB.z)
     end
+    if cmd == "clearfarm" then
+        farmA, farmB = nil, nil
+        fcur = { lane = 0, cell = 0 }
+        dirtyState = true
+        saveLocal()
+        return true, "farm cleared"
+    end
     if cmd == "home" then
         if not home then return false, "no home set" end
         goTo(home.x, home.y, home.z)
@@ -878,6 +916,50 @@ local function runCmd(cmd, a)
         flushBlocks()
         dirtyState = true
         return true, string.format("mined %dx%dx%d", w, l, depth)
+    end
+
+    -- straight down and back: cut a vertical shaft, then climb out the same
+    -- hole. no home/grid needed - it works wherever the turtle stands -----
+    if cmd == "mineDown" then
+        local depth = math.max(1, math.min(512, tonumber(a.depth) or 32))
+        scanMode = a.scan or "walls"
+        local sx, sy, sz = pos.x, pos.y, pos.z
+        local need = depth * 2                    -- down there + back up
+        if turtle.getFuelLevel() ~= "unlimited" and
+            turtle.getFuelLevel() < need then
+            scanMode = "off"
+            return false, string.format("need ~%d fuel, have %s", need,
+                tostring(turtle.getFuelLevel()))
+        end
+        local function full()
+            for i = 1, 16 do
+                if not turtle.getItemDetail(i) then return false end
+            end
+            return true
+        end
+        local dug = 0
+        for i = 1, depth do
+            checkStop()
+            if full() then break end
+            -- dig + descend in one step; move() already refuses to dig a
+            -- peer turtle and stops on unbreakable blocks / empty fuel
+            if not move("down", true) then break end
+            dug = dug + 1
+            if scanMode ~= "off" then scanSides(scanMode == "all") end
+            flushBlocks()
+            dirtyState = true
+        end
+        scanMode = "off"
+        flushBlocks()
+        dirtyState = true
+        -- climb back out the shaft we just cut (or drop back if we broke early)
+        if pos.x ~= sx or pos.y ~= sy or pos.z ~= sz then
+            goTo(sx, sy, sz)
+        end
+        flushBlocks()
+        pushState()
+        return true, string.format("descended %d block(s), back at %d,%d,%d",
+            dug, pos.x, pos.y, pos.z)
     end
 
     -- auto mining: grid around home, chase ores, home when the bag is full - --
