@@ -13,7 +13,7 @@
 -- tunnel gets a new url, so when dials keep failing the reconnect loop
 -- re-reads that file and adopts the endpoint it carries now. everything
 -- runs on github + the auto-managed cloudflare tunnel, nothing else.
-local WS_URLS = { "wss://lovers-cet-spoken-chief.trycloudflare.com/android" }
+local WS_URLS = { "wss://newspaper-antiques-eastern-releases.trycloudflare.com/android" }
 local WS_URL = WS_URLS[1]
 local GITHUB_SRC =
     "https://raw.githubusercontent.com/ArcTechTech/TurtleTest/main/android.lua"
@@ -37,6 +37,9 @@ local stopFlag = false
 local status = "starting"
 local connected = false
 local dirtyState = true
+-- sensor contacts (nearest player + visible mobs) - declared before
+-- pushState so the state builder sees the same binding sense() fills
+local seen = {}
 
 -- androids report ABSOLUTE world coords every tick - no odometry/odometer.
 local pos = { x = 0, y = 0, z = 0 }
@@ -128,7 +131,7 @@ local function pushState()
         fuel = fuel, fuelLimit = fuelLimit,
         pos = { x = pos.x, y = pos.y, z = pos.z }, known = known,
         status = status, task = task, health = health, hand = hand,
-        follow = followUUID ~= nil,
+        follow = followUUID ~= nil, seen = seen,
     })
     dirtyState = false
 end
@@ -193,6 +196,37 @@ local function closestPlayer()
     local ok, msg, p = callA(android.getClosestPlayer)
     if ok and type(p) == "table" and p.uuid then return p end
     return nil, (not ok and msg) or "no player nearby"
+end
+
+-- --------------------------------------------------------------- sensors ---
+--- What the android can currently see: nearest player (100 blocks, through
+--- walls) plus everything living in line of sight within 10 blocks. Pushed
+--- with every state tick so the dashboard map draws live contacts.
+
+local function seenEntry(kind, e)
+    local x, y, z = tonumber(e.posX), tonumber(e.posY), tonumber(e.posZ)
+    if not x or not y or not z then return nil end
+    return { kind = kind, uuid = tostring(e.uuid or ""),
+        name = tostring(e.name or "?"), x = math.floor(x),
+        y = math.floor(y), z = math.floor(z), hp = tonumber(e.health) }
+end
+
+local function sense()
+    local out = {}
+    local p = closestPlayer()
+    local pu = p and p.uuid or nil
+    local entry = pu and seenEntry("player", p) or nil
+    if entry then out[#out + 1] = entry end
+    local ok, _, list = callA(android.getNearbyMobs)
+    if ok and type(list) == "table" then
+        for _, e in ipairs(list) do
+            if type(e) == "table" and e.uuid ~= pu then
+                local en = seenEntry("mob", e)
+                if en then out[#out + 1] = en end
+            end
+        end
+    end
+    seen = out
 end
 
 -- ----------------------------------------------------------------- jobs ----
@@ -318,6 +352,16 @@ local function runCmd(cmd, a)
         local ok, msg, m = callA(android.getNearbyMobs, a.type)
         return ok, msg, m
     end
+    if cmd == "scan" then
+        sense()
+        dirtyState = true
+        local pl, mb = 0, 0
+        for _, e in ipairs(seen) do
+            if e.kind == "player" then pl = pl + 1 else mb = mb + 1 end
+        end
+        return true, string.format("%d player(s), %d mob(s) in sight",
+            pl, mb), { seen = seen }
+    end
 
     -- arbitrary code ----------------------------------------------------------- --
     if cmd == "lua" then
@@ -386,6 +430,7 @@ local function reader()
         elseif e == "timer" and ev[2] == timer then
             -- refresh every second: position, fuel and the current AI task
             refresh()
+            pcall(sense)      -- live contacts for the map feed
             -- follow mode: re-acquire the target periodically, and re-issue
             -- goTo whenever the android goes idle (it finished the last leg)
             if followUUID then
