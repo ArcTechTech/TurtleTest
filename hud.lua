@@ -5,12 +5,14 @@
 -- Persist:   wget <server>/hud.lua?token=<token> startup
 -- Run:       hud [name]
 
--- endpoint list: primary first (cloudflare quick tunnel - its url rotates on
--- every restart) then the permanent tailscale funnel. the reconnect loop
--- rotates through this list, so a tunnel restart never needs a reinstall.
-local WS_URLS = { "https://seas-typically-recruiting-trainers.trycloudflare.com/turtle",
-    "wss://desktop-09fqktu.tail9a2d18.ts.net:8443/turtle" }
+-- single endpoint: the install file on github is re-baked whenever the
+-- tunnel gets a new url, so when dials keep failing the reconnect loop
+-- re-reads that file and adopts the endpoint it carries now. everything
+-- runs on github + the auto-managed cloudflare tunnel, nothing else.
+local WS_URLS = { "https://cargo-separated-seat-epinions.trycloudflare.com/turtle" }
 local WS_URL = WS_URLS[1]
+local GITHUB_SRC =
+    "https://raw.githubusercontent.com/ArcTechTech/TurtleTest/main/hud.lua"
 local TOKEN = "447004d3aa68ca41"
 
 local args = { ... }
@@ -1493,6 +1495,7 @@ print("server: " .. WS_URL)
 
 local urlIdx = 1
 local backoff = 1
+local fails = 0
 while true do
     status = "connecting"
     renderScreen()
@@ -1511,16 +1514,35 @@ while true do
         status = "reconnecting"
         printError(tostring(err))
         log("disconnected: " .. tostring(err), "error")
-        -- rotate endpoints: when the quick tunnel is dead its url has
-        -- changed, so the next attempt goes through the permanent funnel
+        fails = fails + 1
         urlIdx = urlIdx % #WS_URLS + 1
         WS_URL = WS_URLS[urlIdx]
+        -- after a few failed dials the tunnel url has almost certainly
+        -- rotated: re-read the github install file (re-baked on every
+        -- rotation) and adopt whatever endpoint it carries now
+        if fails % 3 == 0 then
+            pcall(function()
+                local h = http.get(GITHUB_SRC)
+                if not h then return end
+                local body = h.readAll()
+                pcall(h.close)
+                local u = body and body:match('WS_URLS = { "(.-)"')
+                if u and u ~= WS_URL then
+                    WS_URL = u
+                    WS_URLS[1] = u
+                    urlIdx = 1
+                    print("[HUD] endpoint refreshed: " .. u)
+                    log("endpoint refreshed: " .. u, "info")
+                end
+            end)
+        end
         renderScreen()
         sleep(backoff)
         backoff = math.min(backoff * 2, 10)
     else
         urlIdx = 1
         WS_URL = WS_URLS[urlIdx]
+        fails = 0
         backoff = 1
         sleep(0.5)
     end
