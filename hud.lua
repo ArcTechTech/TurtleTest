@@ -9,7 +9,7 @@
 -- tunnel gets a new url, so when dials keep failing the reconnect loop
 -- re-reads that file and adopts the endpoint it carries now. everything
 -- runs on github + the auto-managed cloudflare tunnel, nothing else.
-local WS_URLS = { "wss://photographs-movement-analyses-manufacture.trycloudflare.com/turtle" }
+local WS_URLS = { "wss://preservation-prison-harbour-friday.trycloudflare.com/turtle" }
 local WS_URL = WS_URLS[1]
 local GITHUB_SRC =
     "https://raw.githubusercontent.com/ArcTechTech/TurtleTest/main/hud.lua"
@@ -321,7 +321,15 @@ local function peerInDir(dir)
 end
 
 --- Break the block in `dir`; records what was there and marks the cell air.
+--- Single choke point for EVERY dig path (dig cmd, tunnel/mine/autoMine
+--- tall-clear, move auto-dig): refuse to mine a peer turtle. Peers are
+--- blocks, so digging one destroys the other turtle mid-job - the original
+--- "disaster". move() additionally waits for a peer to clear before it
+--- retries the step itself.
 local function digBlock(dir)
+    if peerInDir(dir) then
+        return false, "blocked by another turtle"
+    end
     local scanned = scanMode ~= "off"
     local tx, ty, tz = targetOf(dir)
     if scanned then
