@@ -52,6 +52,16 @@ local hand = ""                -- "name xN" of the main hand
 local followUUID = nil         -- set while in follow mode
 local followAge = 0            -- ticks since the follow target was acquired
 
+-- combat preferences: usernames that must NEVER be targeted (the operator's
+-- own name lives here), plus the guard post + mode. the post and the list
+-- survive reboots through the local state file; the mode itself is armed
+-- from the dashboard and stops with the stop button.
+local ignoreNames = {}
+local guardPost = nil          -- {x,y,z} marked with setguard
+local guardOn = false          -- guard mode armed (guard)
+local guardRadius = 16         -- acquire radius around the post
+local guardTarget = "all"      -- all | players | mobs
+
 -- forward declarations -------------------------------------------------------
 local renderScreen
 
@@ -93,6 +103,11 @@ renderScreen = function()
     if followUUID then
         print("follow yes")
     end
+    if guardOn and guardPost then
+        print(string.format("guard  %d,%d,%d r=%d",
+            math.floor(guardPost.x), math.floor(guardPost.y),
+            math.floor(guardPost.z), guardRadius))
+    end
     term.setTextColor(colors.white)
 end
 
@@ -132,6 +147,10 @@ local function pushState()
         pos = { x = pos.x, y = pos.y, z = pos.z }, known = known,
         status = status, task = task, health = health, hand = hand,
         follow = followUUID ~= nil, seen = seen,
+        guard = (guardOn and guardPost) and
+            { x = guardPost.x, y = guardPost.y, z = guardPost.z,
+              r = guardRadius, target = guardTarget } or nil,
+        ignore = table.concat(ignoreNames, ","),
     })
     dirtyState = false
 end
@@ -198,6 +217,125 @@ local function closestPlayer()
     return nil, (not ok and msg) or "no player nearby"
 end
 
+-- --------------------------------------------------------------- persist ----
+-- guard post + ignore list live in their own small file so a reboot never
+-- forgets where the android was told to stand (or who not to shoot).
+local STATE_FILE = "/.android_hud_state"
+
+local function saveLocal()
+    if not (fs and fs.open) then return end
+    pcall(function()
+        local h = fs.open(STATE_FILE, "w")
+        if not h then return end
+        h.writeLine(textutils.serializeJSON({
+            ignore = ignoreNames, post = guardPost,
+            r = guardRadius, tgt = guardTarget,
+        }))
+        h.close()
+    end)
+end
+
+local function loadLocal()
+    if not (fs and fs.exists and fs.exists(STATE_FILE)) then return end
+    pcall(function()
+        local h = fs.open(STATE_FILE, "r")
+        if not h then return end
+        local raw = h.readLine()
+        h.close()
+        local s = raw and textutils.unserializeJSON(raw)
+        if type(s) ~= "table" then return end
+        if type(s.ignore) == "table" then ignoreNames = s.ignore end
+        if type(s.post) == "table" and s.post.x and s.post.y and s.post.z then
+            guardPost = { x = s.post.x, y = s.post.y, z = s.post.z }
+        end
+        if tonumber(s.r) then guardRadius = tonumber(s.r) end
+        if type(s.tgt) == "string" then guardTarget = s.tgt end
+    end)
+end
+loadLocal()
+
+-- ------------------------------------------------------------- targeting ----
+-- the mod matches a type filter with `contains()` against the entity's
+-- REGISTRY id (SensorModule.getTypePredicate), so "spider" also catches
+-- cave_spider and "skeleton" wither_skeleton. these are registry-id
+-- substrings of hostile mobs - a cow can never match one.
+local HOSTILE_TYPES = {
+    "zombie", "husk", "drowned", "skeleton", "stray", "bogged", "spider",
+    "creeper", "witch", "enderman", "blaze", "ghast", "slime", "magma_cube",
+    "pillager", "vindicator", "evoker", "vex", "ravager", "guardian",
+    "phantom", "silverfish", "shulker", "piglin", "hoglin", "zoglin",
+    "warden", "wither", "breeze",
+}
+
+--- Is this name on the never-target list? (case-insensitive)
+local function isIgnored(name)
+    if not name then return false end
+    local n = string.lower(tostring(name))
+    for _, ig in ipairs(ignoreNames) do
+        if ig == n then return true end
+    end
+    return false
+end
+
+local function dist2(ax, ay, az, bx, by, bz)
+    local dx, dy, dz = ax - bx, ay - by, az - bz
+    return dx * dx + dy * dy + dz * dz
+end
+
+--- Closest hostile mob in sensor range (line of sight, 10/30 blocks).
+local function closestHostile()
+    local best, bestd = nil, math.huge
+    for _, t in ipairs(HOSTILE_TYPES) do
+        local ok, _, m = callA(android.getClosestMob, t)
+        if ok and type(m) == "table" and m.uuid and m.uuid ~= "" then
+            local x = tonumber(m.posX)
+            local y = tonumber(m.posY)
+            local z = tonumber(m.posZ)
+            if x and y and z then
+                local d = dist2(x, y, z, pos.x, pos.y, pos.z)
+                if d < bestd then best, bestd = m, d end
+            end
+        end
+    end
+    if not best then return nil, "no hostile nearby" end
+    return best
+end
+
+--- Player candidates: the closest player (100 blocks, through walls) plus
+--- everyone visible in line of sight. the mod's mob query with type
+--- "player" matches the player entity's registry id, so one ignored name
+--- never hides the other players behind it.
+local function playerCandidates()
+    local out, seenU = {}, {}
+    local function add(p)
+        if type(p) == "table" and p.uuid and not seenU[p.uuid] then
+            seenU[p.uuid] = true
+            out[#out + 1] = p
+        end
+    end
+    add(closestPlayer())
+    local ok, _, list = callA(android.getNearbyMobs, "player")
+    if ok and type(list) == "table" then
+        for _, e in ipairs(list) do add(e) end
+    end
+    return out
+end
+
+--- Nearest entry of `list` to a point, or nil when the list is empty.
+local function nearestTo(x, y, z, list)
+    local best, bd = nil, math.huge
+    for _, e in ipairs(list) do
+        local ex = tonumber(e.posX)
+        local ey = tonumber(e.posY)
+        local ez = tonumber(e.posZ)
+        if ex and ey and ez then
+            local d = dist2(ex, ey, ez, x, y, z)
+            if d < bd then best, bd = e, d end
+        end
+    end
+    return best
+end
+
 -- --------------------------------------------------------------- sensors ---
 --- What the android can currently see: nearest player (100 blocks, through
 --- walls) plus everything living in line of sight within 10 blocks. Pushed
@@ -258,12 +396,71 @@ local function runCmd(cmd, a)
     end
     if cmd == "attack" then
         local u = a.uuid
-        if not u then
-            local p, err = closestPlayer()
-            if not p then return false, err end
-            u = p.uuid
+        if u then
+            -- explicit target (map click): swing at exactly that entity
+            return callA(android.attack, tostring(u))
         end
-        return callA(android.attack, tostring(u))
+        -- no uuid: pick a target by mode. "mobs" (the default) only ever
+        -- selects HOSTILE mobs - never a player, never a cow; "players"
+        -- selects the nearest player that isn't on the ignore list.
+        local mode = tostring(a.target or a.mode or "mobs")
+        if mode == "players" then
+            local cands = {}
+            for _, p in ipairs(playerCandidates()) do
+                if not isIgnored(p.name) then cands[#cands + 1] = p end
+            end
+            if #cands == 0 then
+                return false, "no player nearby (or all on the ignore list)"
+            end
+            local best = nearestTo(pos.x, pos.y, pos.z, cands)
+            return callA(android.attack, tostring(best.uuid))
+        end
+        local m, err = closestHostile()
+        if not m then return false, err end
+        return callA(android.attack, tostring(m.uuid))
+    end
+    if cmd == "setignore" then
+        local names = tostring(a.names or a.name or "")
+        ignoreNames = {}
+        for w in string.gmatch(names, "[^,%s]+") do
+            ignoreNames[#ignoreNames + 1] = string.lower(w)
+        end
+        saveLocal()
+        dirtyState = true
+        return true, #ignoreNames == 0 and "ignore list cleared"
+            or ("ignoring " .. table.concat(ignoreNames, ", "))
+    end
+    if cmd == "setguard" then
+        if not known then return false, "no position yet" end
+        guardPost = { x = pos.x, y = pos.y, z = pos.z }
+        saveLocal()
+        dirtyState = true
+        return true, string.format("guard post set at %d,%d,%d",
+            math.floor(pos.x), math.floor(pos.y), math.floor(pos.z))
+    end
+    if cmd == "clearguard" then
+        guardPost = nil
+        guardOn = false
+        saveLocal()
+        dirtyState = true
+        return true, "guard post cleared"
+    end
+    if cmd == "guard" then
+        if not guardPost then
+            return false, "no guard post set (use setguard first)"
+        end
+        guardRadius = math.floor(math.max(4, math.min(128,
+            tonumber(a.radius) or guardRadius)))
+        local tg = tostring(a.target or guardTarget or "all")
+        if tg == "hostiles" then tg = "mobs" end
+        if tg ~= "players" and tg ~= "mobs" then tg = "all" end
+        guardTarget = tg
+        guardOn = true
+        saveLocal()
+        dirtyState = true
+        return true, string.format("guarding %d,%d,%d r=%d (%s)",
+            math.floor(guardPost.x), math.floor(guardPost.y),
+            math.floor(guardPost.z), guardRadius, guardTarget)
     end
     if cmd == "stop" or cmd == "cancelTask" then
         followUUID = nil
@@ -393,6 +590,54 @@ local function runCmd(cmd, a)
     return false, "unknown command: " .. tostring(cmd)
 end
 
+--- One guard beat: engage the nearest allowed target within radius of the
+--- post, or hold the post when nobody's around. Runs on the 1s tick.
+local function guardTick()
+    if not guardOn or not guardPost then return end
+    -- already swinging: let the attack task finish (the mod's own guard
+    -- program works the same way - one target at a time). the real task
+    -- is called "attacking"; "attack"/"attackingMob" kept for safety.
+    if task == "attacking" or task == "attack" or task == "attackingMob" then
+        return
+    end
+    local r2 = guardRadius * guardRadius
+    local wantPlayers = guardTarget ~= "mobs" and guardTarget ~= "hostiles"
+    local wantMobs = guardTarget ~= "players"
+    local best, bd = nil, math.huge
+    local function consider(e)
+        if type(e) ~= "table" or not e.uuid or isIgnored(e.name) then return end
+        local x = tonumber(e.posX)
+        local y = tonumber(e.posY)
+        local z = tonumber(e.posZ)
+        if not x or not y or not z then return end
+        -- radius is measured from the POST, not from the android
+        local d = dist2(x, y, z, guardPost.x, guardPost.y, guardPost.z)
+        if d > r2 then return end
+        if d < bd then best, bd = e, d end
+    end
+    if wantPlayers then
+        for _, p in ipairs(playerCandidates()) do consider(p) end
+    end
+    if wantMobs then
+        for _, t in ipairs(HOSTILE_TYPES) do
+            local ok, _, m = callA(android.getClosestMob, t)
+            if ok then consider(m) end
+        end
+    end
+    if best then
+        pcall(android.attack, tostring(best.uuid))
+        dirtyState = true
+    elseif task == "idle" then
+        -- nobody to hit: stand on the post (only re-path when clearly off it)
+        local d = dist2(pos.x, pos.y, pos.z,
+            guardPost.x, guardPost.y, guardPost.z)
+        if d > 4 then
+            pcall(android.moveTo, guardPost.x, guardPost.y, guardPost.z)
+            dirtyState = true
+        end
+    end
+end
+
 -- --------------------------------------------------------------- coroutines --
 local function handleMessage(raw)
     local m = textutils.unserializeJSON(raw)
@@ -402,6 +647,7 @@ local function handleMessage(raw)
             stopFlag = true
             jobs = {}
             followUUID = nil
+            guardOn = false
             pcall(android.cancelTask)
             push({ t = "result", seq = m.seq, ok = true, msg = "stopping" })
             log("stop requested", "warn")
@@ -444,6 +690,9 @@ local function reader()
                 end
                 dirtyState = true
             end
+            -- guard mode: re-scan the post's neighbourhood every beat and
+            -- engage (or walk back to the post when the area is clear)
+            if guardOn then guardTick() end
             pushState()
             if not flushOutbox() then return end
             renderScreen()
