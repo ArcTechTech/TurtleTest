@@ -9,7 +9,7 @@
 -- tunnel gets a new url, so when dials keep failing the reconnect loop
 -- re-reads that file and adopts the endpoint it carries now. everything
 -- runs on github + the auto-managed cloudflare tunnel, nothing else.
-local WS_URLS = { "wss://campaigns-yang-thumbzilla-drives.trycloudflare.com/turtle" }
+local WS_URLS = { "wss://preservation-prison-harbour-friday.trycloudflare.com/turtle" }
 local WS_URL = WS_URLS[1]
 local GITHUB_SRC =
     "https://raw.githubusercontent.com/ArcTechTech/TurtleTest/main/hud.lua"
@@ -1513,8 +1513,11 @@ local function worker()
             dirtyState = true
             renderScreen()
             if not ok then
-                -- bumping a wall while driving is normal feedback, not a crash
-                local lvl = tostring(msg):find("obstruct", 1, true)
+                -- bumping a wall (or waiting out a peer turtle) while driving
+                -- is normal feedback, not a crash
+                local m2 = tostring(msg)
+                local lvl = (m2:find("obstruct", 1, true) or
+                    m2:find("blocked by another turtle", 1, true))
                     and "warn" or "error"
                 log(tostring(job.cmd) .. ": " .. tostring(msg), lvl)
             end
