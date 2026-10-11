@@ -9,7 +9,7 @@
 -- terreng/computercraft-streaming-music pattern: pull DFPWM chunks over
 -- http, decode with cc.audio.dfpwm, feed speaker.playAudio paced by the
 -- speaker_audio_empty event.
-local WS_URL = "wss://tale-italic-survey-direction.trycloudflare.com/music"
+local WS_URL = "wss://acquisition-joy-major-traffic.trycloudflare.com/music"
 local TOKEN = "447004d3aa68ca41"
 
 local args = { ... }
