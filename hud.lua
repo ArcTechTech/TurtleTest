@@ -9,7 +9,7 @@
 -- tunnel gets a new url, so when dials keep failing the reconnect loop
 -- re-reads that file and adopts the endpoint it carries now. everything
 -- runs on github + the auto-managed cloudflare tunnel, nothing else.
-local WS_URLS = { "wss://aaa-replication-peripheral-understand.trycloudflare.com/turtle" }
+local WS_URLS = { "wss://causing-uri-bringing-manufacturer.trycloudflare.com/turtle" }
 local WS_URL = WS_URLS[1]
 local GITHUB_SRC =
     "https://raw.githubusercontent.com/ArcTechTech/TurtleTest/main/hud.lua"
@@ -223,12 +223,21 @@ local function invList()
 end
 
 local function pushState()
+    local farmInfo = nil
+    if farmA and farmB then
+        farmInfo = { ax = farmA.x, ay = farmA.y, az = farmA.z,
+                     bx = farmB.x, by = farmB.y, bz = farmB.z,
+                     lane = fcur.lane, cell = fcur.cell }
+    elseif farmA then
+        farmInfo = { ax = farmA.x, ay = farmA.y, az = farmA.z, partial = true }
+    end
     push({
         t = "state", name = NAME, label = os.getComputerLabel(),
         fuel = turtle.getFuelLevel(), fuelLimit = turtle.getFuelLimit(),
         pos = { x = pos.x, y = pos.y, z = pos.z }, known = known,
         facing = facing, status = status, sel = turtle.getSelectedSlot(),
-        home = home, inv = invList(), crafty = turtle.craft ~= nil,
+        home = home, farm = farmInfo, inv = invList(),
+        crafty = turtle.craft ~= nil,
         left = peripheral.getType("left"), right = peripheral.getType("right"),
     })
     dirtyState = false
@@ -808,26 +817,59 @@ local function runCmd(cmd, a)
         return true, "home set"
     end
     if cmd == "setfarm" then
-        local here = { x = pos.x, y = pos.y, z = pos.z }
+        -- three ways to mark the field:
+        --   (no args)             drive to each corner, setfarm twice
+        --   {x,y,z}               mark the next corner at typed coords
+        --   {ax,ay,az,bx,by,bz}   both corners in one shot, no driving
+        local function fieldMsg()
+            local w = math.abs(farmB.x - farmA.x) + 1
+            local l = math.abs(farmB.z - farmA.z) + 1
+            return string.format("field %dx%d marked (%d,%d)-(%d,%d)",
+                w, l, farmA.x, farmA.z, farmB.x, farmB.z)
+        end
+        local function sameY(c)
+            if farmA and farmA.y ~= c.y then
+                return false, string.format(
+                    "corner y %d != corner A y %d (mark both corners on the same crop layer)",
+                    c.y, farmA.y)
+            end
+            return true
+        end
+        local ax, ay, az = tonumber(a.ax), tonumber(a.ay), tonumber(a.az)
+        local bx, by, bz = tonumber(a.bx), tonumber(a.by), tonumber(a.bz)
+        if ax and ay and az and bx and by and bz then
+            if ay ~= by then
+                return false, string.format(
+                    "corners differ in y (%d vs %d) - mark both on the same crop layer",
+                    ay, by)
+            end
+            farmA, farmB = { x = ax, y = ay, z = az }, { x = bx, y = by, z = bz }
+            fcur = { lane = 0, cell = 0 }
+            dirtyState = true
+            saveLocal()
+            return true, fieldMsg()
+        end
+        local x, y, z = tonumber(a.x), tonumber(a.y), tonumber(a.z)
+        local here = (x and y and z) and { x = x, y = y, z = z }
+            or { x = pos.x, y = pos.y, z = pos.z }
         if not farmA or farmB then
-            -- first click (or restart after both corners were set)
+            -- first mark (or restart after both corners were set)
             farmA, farmB = here, nil
             fcur = { lane = 0, cell = 0 }
             dirtyState = true
             saveLocal()
             return true, string.format(
-                "farm corner A at %d,%d,%d - drive to the opposite corner and setfarm again",
+                "farm corner A at %d,%d,%d - mark the opposite corner (setfarm again, or pass coords)",
                 here.x, here.y, here.z)
         end
-        -- second click: the marked rectangle is the whole field
+        -- second mark: the rectangle between the corners is the field
+        local okY, errY = sameY(here)
+        if not okY then return false, errY end
         farmB = here
         fcur = { lane = 0, cell = 0 }
         dirtyState = true
         saveLocal()
-        local w = math.abs(farmB.x - farmA.x) + 1
-        local l = math.abs(farmB.z - farmA.z) + 1
-        return true, string.format("field %dx%d marked (%d,%d)-(%d,%d)",
-            w, l, farmA.x, farmA.z, farmB.x, farmB.z)
+        return true, fieldMsg()
     end
     if cmd == "clearfarm" then
         farmA, farmB = nil, nil
@@ -1118,6 +1160,9 @@ local function runCmd(cmd, a)
         if not home then
             return false, "set home first (sethome)"
         end
+        -- laps=N: farm N full laps then head home (0/absent: run until
+        -- stopped or inventory full)
+        local maxLaps = math.floor(tonumber(a.laps) or 0)
         scanMode = "off"
         -- normalized bounds: corners are the crop layer, order independent
         local x1 = math.min(farmA.x, farmB.x)
@@ -1251,8 +1296,16 @@ local function runCmd(cmd, a)
         if not okP then
             return false, "cannot reach the field: " .. tostring(errP)
         end
+        -- corner must be crop OR open soil (bare farmland is a valid corner)
+        local SOIL = {
+            ["minecraft:farmland"] = true, ["minecraft:dirt"] = true,
+            ["minecraft:grass_block"] = true, ["minecraft:coarse_dirt"] = true,
+            ["minecraft:rooted_dirt"] = true, ["minecraft:sand"] = true,
+            ["minecraft:red_sand"] = true, ["minecraft:mud"] = true,
+            ["minecraft:mycelium"] = true, ["minecraft:podzol"] = true,
+        }
         local hasC, corner = turtle.inspectDown()
-        if hasC and not isCrop(corner) then
+        if hasC and not isCrop(corner) and not SOIL[tostring(corner.name)] then
             return false, string.format(
                 "corner is %s, not a field (mark corners on the crops/soil)",
                 tostring(corner.name))
@@ -1277,6 +1330,23 @@ local function runCmd(cmd, a)
                 return true, string.format(
                     "full - homed at %d,%d,%d (harvested %d, planted %d)",
                     pos.x, pos.y, pos.z, harvested, planted)
+            end
+            if maxLaps > 0 and laps >= maxLaps then
+                flushBlocks()
+                log(string.format("farm: %d lap(s) done - heading home", laps),
+                    "ok")
+                status = "farm: homing"
+                dirtyState = true
+                local dist = math.abs(home.x - pos.x) + math.abs(home.y - pos.y)
+                    + math.abs(home.z - pos.z) + 16
+                pcall(runCmd, "refuel", { min = dist })
+                goTo(home.x, home.y, home.z)
+                scanMode = "off"
+                flushBlocks()
+                pushState()
+                return true, string.format(
+                    "homed after %d lap(s) at %d,%d,%d (harvested %d, planted %d)",
+                    laps, pos.x, pos.y, pos.z, harvested, planted)
             end
             local cx, cz = farmCell()
             local okG, errG = flyTo(cx, py, cz)
