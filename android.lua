@@ -51,6 +51,14 @@ local task = "idle"
 local hand = ""                -- "name xN" of the main hand
 local followUUID = nil         -- set while in follow mode
 local followAge = 0            -- ticks since the follow target was acquired
+local atkUUID = nil            -- set while in chase-attack mode (map click)
+local atkName = nil            -- display name of the current atk target
+local atkFails = 0             -- consecutive re-issue failures (target lost?)
+
+--- Drop the chase-attack lock. Used by every mode that takes over.
+local function clearAtk()
+    atkUUID, atkName, atkFails = nil, nil, 0
+end
 
 -- combat preferences: usernames that must NEVER be targeted (the operator's
 -- own name lives here), plus the guard post + mode. the post and the list
@@ -103,6 +111,9 @@ renderScreen = function()
     if followUUID then
         print("follow yes")
     end
+    if atkUUID then
+        print("atk    " .. tostring(atkName or atkUUID))
+    end
     if guardOn and guardPost then
         print(string.format("guard  %d,%d,%d r=%d",
             math.floor(guardPost.x), math.floor(guardPost.y),
@@ -147,6 +158,7 @@ local function pushState()
         pos = { x = pos.x, y = pos.y, z = pos.z }, known = known,
         status = status, task = task, health = health, hand = hand,
         follow = followUUID ~= nil, seen = seen,
+        atk = atkUUID and { uuid = atkUUID, name = atkName or "?" } or nil,
         guard = (guardOn and guardPost) and
             { x = guardPost.x, y = guardPost.y, z = guardPost.z,
               r = guardRadius, target = guardTarget } or nil,
@@ -377,6 +389,7 @@ local function runCmd(cmd, a)
         local x, y, z = xyzOf(a)
         if not x then return false, "need x, y, z" end
         followUUID = nil            -- a manual move cancels follow
+        clearAtk()                  -- ...and any chase-attack lock
         return callA(android.moveTo, x, y, z)
     end
     if cmd == "goTo" then
@@ -387,12 +400,32 @@ local function runCmd(cmd, a)
     if cmd == "follow" then
         local p, err = closestPlayer()
         if not p then return false, err end
+        clearAtk()                  -- follow takes over from chase-attack
         followUUID = p.uuid
         followAge = 0
         -- kick off the first leg right away
         pcall(android.goTo, followUUID)
         dirtyState = true
         return true, "following " .. tostring(p.name or p.uuid)
+    end
+    -- persistent chase-attack (map click): the mod's AttackEntityTask
+    -- already follows a moving target, but if the task ever dies early
+    -- (pathing broke, something cancelled it) the reader tick below
+    -- re-issues it until the target stops answering ---------------------- --
+    if cmd == "atk" then
+        local u = a.uuid or a.target
+        if not u then return false, "need uuid" end
+        u = tostring(u)
+        -- fire one swing immediately so a bad uuid / no fuel surfaces as
+        -- the command's own result, not a silent nothing
+        local ok, msg = callA(android.attack, u)
+        if not ok then return false, msg end
+        followUUID = nil            -- chase-attack replaces follow
+        atkUUID = u
+        atkName = tostring(a.name or "target")
+        atkFails = 0
+        dirtyState = true
+        return true, "chasing " .. atkName
     end
     if cmd == "attack" then
         local u = a.uuid
@@ -464,6 +497,7 @@ local function runCmd(cmd, a)
     end
     if cmd == "stop" or cmd == "cancelTask" then
         followUUID = nil
+        clearAtk()
         dirtyState = true
         return callA(android.cancelTask)
     end
@@ -647,6 +681,7 @@ local function handleMessage(raw)
             stopFlag = true
             jobs = {}
             followUUID = nil
+            clearAtk()
             guardOn = false
             pcall(android.cancelTask)
             push({ t = "result", seq = m.seq, ok = true, msg = "stopping" })
@@ -690,9 +725,38 @@ local function reader()
                 end
                 dirtyState = true
             end
+            -- chase-attack mode: the mod keeps its AttackEntityTask alive
+            -- while the target lives (task name "attacking"). when the
+            -- task went quiet, re-issue - and drop the target once it
+            -- stops answering (died, despawned, or out of fuel).
+            if atkUUID then
+                local fighting = task == "attacking" or task == "attack" or
+                    task == "attackingMob"
+                if not fighting then
+                    local ok, msg = callA(android.attack, atkUUID)
+                    if ok then
+                        atkFails = 0
+                    else
+                        msg = tostring(msg or "")
+                        if msg:find("fuel", 1, true) then
+                            log("cannot chase: " .. msg, "warn")
+                            clearAtk()
+                        else
+                            atkFails = atkFails + 1
+                            if atkFails >= 5 then
+                                log("target lost: " ..
+                                    tostring(atkName or atkUUID), "warn")
+                                clearAtk()
+                            end
+                        end
+                    end
+                end
+                dirtyState = true
+            end
             -- guard mode: re-scan the post's neighbourhood every beat and
-            -- engage (or walk back to the post when the area is clear)
-            if guardOn then guardTick() end
+            -- engage (or walk back to the post when the area is clear).
+            -- an explicit chase-attack lock outranks the guard beat.
+            if guardOn and not atkUUID then guardTick() end
             pushState()
             if not flushOutbox() then return end
             renderScreen()
@@ -789,6 +853,7 @@ while true do
     jobs = {}
     stopFlag = false
     followUUID = nil
+    clearAtk()
     if ws then pcall(ws.close) end
     ws = nil
     outbox = {}
