@@ -9,16 +9,21 @@
 -- terreng/computercraft-streaming-music pattern: pull DFPWM chunks over
 -- http, decode with cc.audio.dfpwm, feed speaker.playAudio paced by the
 -- speaker_audio_empty event.
-local WS_URL = "wss://acquisition-joy-major-traffic.trycloudflare.com/music"
+local WS_URL = "wss://aaa-replication-peripheral-understand.trycloudflare.com/music"
 local TOKEN = "447004d3aa68ca41"
 
 local args = { ... }
 local CID = os.getComputerID()
 local NAME = args[1] or os.getComputerLabel() or ("music-" .. tostring(CID))
 
--- http origin for chunk pulls (the ws endpoint's http origin)
-local BASE = WS_URL:gsub("^wss://", "http://"):gsub("^ws://", "http://")
+-- http origin for chunk pulls (the ws endpoint's http origin); recomputed
+-- when the endpoint self-heals after a tunnel rotation
+local BASE = ""
+local function deriveBase()
+    BASE = WS_URL:gsub("^wss://", "http://"):gsub("^ws://", "http://")
                    :gsub("/music$", "")
+end
+deriveBase()
 
 -- --------------------------------------------------------------- speakers --
 local speakers = {}
@@ -39,6 +44,7 @@ local tlen = 0                -- track length in bytes
 local tname = ""              -- track name (display only)
 local dirtyState = true
 local ws = nil                -- active websocket (set per session)
+local gotWelcome = false      -- set once the server welcomes a session
 
 local outbox = {}
 local function push(o)
@@ -227,6 +233,7 @@ local function handleMessage(raw)
         end
         flushOutbox()
     elseif m.t == "welcome" then
+        gotWelcome = true
         dirtyState = true
         pushState()
         flushOutbox()
@@ -282,7 +289,41 @@ local function waitForWelcome()
     end
 end
 
+-- ---------------------------------------------------------- self-heal -----
+-- Quick tunnels get a fresh url on every server restart; the server
+-- re-bakes this install file onto github whenever that happens. After a few
+-- failed sessions, re-read the published file and adopt the URL/token it
+-- carries (URL only - never code), same as the turtle and android agents.
+local INSTALL_URL =
+    "https://raw.githubusercontent.com/ArcTechTech/TurtleTest/main/music.lua"
+
+local function refreshEndpoint()
+    local ok, h = pcall(http.get, INSTALL_URL)
+    if not ok or not h then return false end
+    local okR, body = pcall(h.readAll)
+    pcall(h.close)
+    if not okR or not body then return false end
+    local u = body:match('local%s+WS_URL%s*=%s*"([^"]+)"')
+    local t = body:match('local%s+TOKEN%s*=%s*"([^"]+)"')
+    local changed = false
+    if u and u ~= "wss://aaa-replication-peripheral-understand.trycloudflare.com/music" and u ~= WS_URL then
+        WS_URL = u
+        changed = true
+    end
+    if t and t ~= "447004d3aa68ca41" and t ~= TOKEN then
+        TOKEN = t
+        changed = true
+    end
+    if changed then
+        deriveBase()
+        log("endpoint refreshed -> " .. WS_URL, "ok")
+        print("endpoint refreshed -> " .. WS_URL)
+    end
+    return changed
+end
+
 local function session()
+    gotWelcome = false
     local w, err = http.websocket(WS_URL)
     if not w then error(tostring(err), 0) end
     ws = w
@@ -297,20 +338,29 @@ end
 print("Music agent starting...")
 print("server: " .. WS_URL)
 
-local backoff = 1
+local backoff, fails = 1, 0
 while true do
     local ok, err = pcall(session)
     haltPlayback()
     if ws then pcall(ws.close) end
     ws = nil
     outbox = {}
-    if not ok then
-        printError(tostring(err))
-        log("disconnected: " .. tostring(err), "error")
+    if gotWelcome then
+        -- a session that reached the server counts as healthy: a mid-
+        -- playback drop (tunnel dying) starts a fresh failure streak
+        fails = 0
+        backoff = 1
+        sleep(ok and 0.5 or 0.25)
+    else
+        fails = fails + 1
+        if fails % 3 == 0 then
+            -- the tunnel probably rotated: adopt the freshly baked url
+            refreshEndpoint()
+        end
+        printError(tostring(err or "connection closed"))
+        log("disconnected: " .. tostring(err or "connection closed"),
+            "error")
         sleep(backoff)
         backoff = math.min(backoff * 2, 10)
-    else
-        backoff = 1
-        sleep(0.5)
     end
 end
