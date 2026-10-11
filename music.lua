@@ -9,7 +9,7 @@
 -- terreng/computercraft-streaming-music pattern: pull DFPWM chunks over
 -- http, decode with cc.audio.dfpwm, feed speaker.playAudio paced by the
 -- speaker_audio_empty event.
-local WS_URL = "wss://aaa-replication-peripheral-understand.trycloudflare.com/music"
+local WS_URL = "wss://acquisition-joy-major-traffic.trycloudflare.com/music"
 local TOKEN = "447004d3aa68ca41"
 
 local args = { ... }
@@ -306,7 +306,7 @@ local function refreshEndpoint()
     local u = body:match('local%s+WS_URL%s*=%s*"([^"]+)"')
     local t = body:match('local%s+TOKEN%s*=%s*"([^"]+)"')
     local changed = false
-    if u and u ~= "wss://aaa-replication-peripheral-understand.trycloudflare.com/music" and u ~= WS_URL then
+    if u and u ~= "wss://acquisition-joy-major-traffic.trycloudflare.com/music" and u ~= WS_URL then
         WS_URL = u
         changed = true
     end
@@ -338,7 +338,7 @@ end
 print("Music agent starting...")
 print("server: " .. WS_URL)
 
-local backoff, fails = 1, 0
+local backoff = 1
 while true do
     local ok, err = pcall(session)
     haltPlayback()
@@ -348,15 +348,12 @@ while true do
     if gotWelcome then
         -- a session that reached the server counts as healthy: a mid-
         -- playback drop (tunnel dying) starts a fresh failure streak
-        fails = 0
         backoff = 1
         sleep(ok and 0.5 or 0.25)
     else
-        fails = fails + 1
-        if fails % 3 == 0 then
-            -- the tunnel probably rotated: adopt the freshly baked url
-            refreshEndpoint()
-        end
+        -- the tunnel probably rotated: adopt the freshly baked url from
+        -- github (URL only, never code); the backoff still paces retries
+        refreshEndpoint()
         printError(tostring(err or "connection closed"))
         log("disconnected: " .. tostring(err or "connection closed"),
             "error")
