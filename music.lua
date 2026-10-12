@@ -9,7 +9,7 @@
 -- terreng/computercraft-streaming-music pattern: pull DFPWM chunks over
 -- http, decode with cc.audio.dfpwm, feed speaker.playAudio paced by the
 -- speaker_audio_empty event.
-local WS_URL = "wss://acquisition-joy-major-traffic.trycloudflare.com/music"
+local WS_URL = "wss://after-highlight-gdp-heads.trycloudflare.com/music"
 local TOKEN = "447004d3aa68ca41"
 
 local args = { ... }
@@ -244,6 +244,7 @@ local function handleMessage(raw)
 end
 
 local function reader()
+    local tick = 0
     local timer = os.startTimer(1)
     while true do
         local ev = { os.pullEvent() }
@@ -251,8 +252,13 @@ local function reader()
         if e == "music_flush" then
             if not flushOutbox() then return end
         elseif e == "timer" and ev[2] == timer then
+            tick = tick + 1
             if #speakers == 0 then rescanSpeakers() end
-            if dirtyState or playing then pushState() end
+            -- heartbeat: the server drops units after 20s of silence, so
+            -- push at least every 10s even when nothing is happening
+            if dirtyState or playing or tick % 10 == 0 then
+                pushState()
+            end
             if not flushOutbox() then return end
             timer = os.startTimer(1)
         elseif e == "websocket_message" and ev[2] == WS_URL then
@@ -306,7 +312,7 @@ local function refreshEndpoint()
     local u = body:match('local%s+WS_URL%s*=%s*"([^"]+)"')
     local t = body:match('local%s+TOKEN%s*=%s*"([^"]+)"')
     local changed = false
-    if u and u ~= "wss://acquisition-joy-major-traffic.trycloudflare.com/music" and u ~= WS_URL then
+    if u and u ~= "wss://after-highlight-gdp-heads.trycloudflare.com/music" and u ~= WS_URL then
         WS_URL = u
         changed = true
     end
