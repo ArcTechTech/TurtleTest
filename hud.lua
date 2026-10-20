@@ -9,7 +9,7 @@
 -- tunnel gets a new url, so when dials keep failing the reconnect loop
 -- re-reads that file and adopts the endpoint it carries now. everything
 -- runs on github + the auto-managed cloudflare tunnel, nothing else.
-local WS_URLS = { "wss://technologies-woods-ellis-bizrate.trycloudflare.com/turtle" }
+local WS_URLS = { "wss://classroom-penguin-mentioned-demanding.trycloudflare.com/turtle" }
 local WS_URL = WS_URLS[1]
 local GITHUB_SRC =
     "https://raw.githubusercontent.com/ArcTechTech/TurtleTest/main/hud.lua"
