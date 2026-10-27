@@ -9,7 +9,7 @@
 -- terreng/computercraft-streaming-music pattern: pull DFPWM chunks over
 -- http, decode with cc.audio.dfpwm, feed speaker.playAudio paced by the
 -- speaker_audio_empty event.
-local WS_URL = "wss://duke-boxed-bay-crystal.trycloudflare.com/music"
+local WS_URL = "wss://message-ink-soonest-stud.trycloudflare.com/music"
 local TOKEN = "447004d3aa68ca41"
 
 local args = { ... }
@@ -24,6 +24,28 @@ local function deriveBase()
                    :gsub("/music$", "")
 end
 deriveBase()
+
+-- ---------------------------------------------------------- timing utils --
+-- CC has no async http: a request blocks the calling coroutine and its
+-- internal event loop eats every event that arrives while it waits. Run
+-- inside reader(), that silently kills the 1s heartbeat timer (one-shot,
+-- re-armed only by its own branch) - the unit then goes offline in the
+-- HUD 20s later and every transport command refuses, until the in-game
+-- computer is rebooted. So every blocking call gets a deadline, and
+-- reader() re-arms its timer after any command that may have blocked.
+local function timedCall(secs, fn, ...)
+    local ok, a, b
+    local which = parallel.waitForAny(
+        function() ok, a, b = pcall(fn, ...) end,
+        function() sleep(secs) end)
+    if which == 2 then
+        return nil, "timed out after " .. tostring(secs) .. "s"
+    end
+    if not ok then
+        return nil, tostring(a)
+    end
+    return a, b
+end
 
 -- --------------------------------------------------------------- speakers --
 local speakers = {}
@@ -45,6 +67,7 @@ local tname = ""              -- track name (display only)
 local dirtyState = true
 local ws = nil                -- active websocket (set per session)
 local gotWelcome = false      -- set once the server welcomes a session
+local resumeAt = nil          -- byte offset to resume after a reconnect
 
 local outbox = {}
 local function push(o)
@@ -94,8 +117,8 @@ local function openStream(from)
     closeStream()
     local url = BASE .. "/music/stream?token=" ..
         textutils.urlEncode(TOKEN) .. "&from=" .. tostring(from)
-    local h = http.get(url)
-    if not h then return nil, "stream fetch failed" end
+    local h, err = timedCall(15, http.get, url)
+    if not h then return nil, err or "stream fetch failed" end
     stream = h
     return true
 end
@@ -119,6 +142,11 @@ local function playChunk(thisGen)
     end
     local chunk = stream.read(16384)
     if not chunk then
+        if playing and tlen > 0 and offset < tlen then
+            -- the tunnel dropped the stream mid-track: raise so the player
+            -- reopens it at `offset` instead of "finishing" the track early
+            error("stream ended early (" .. offset .. "/" .. tlen .. ")", 0)
+        end
         -- track finished cleanly
         playing = false
         closeStream()
@@ -312,7 +340,7 @@ local function refreshEndpoint()
     local u = body:match('local%s+WS_URL%s*=%s*"([^"]+)"')
     local t = body:match('local%s+TOKEN%s*=%s*"([^"]+)"')
     local changed = false
-    if u and u ~= "wss://duke-boxed-bay-crystal.trycloudflare.com/music" and u ~= WS_URL then
+    if u and u ~= "wss://message-ink-soonest-stud.trycloudflare.com/music" and u ~= WS_URL then
         WS_URL = u
         changed = true
     end
