@@ -9,7 +9,7 @@
 -- terreng/computercraft-streaming-music pattern: pull DFPWM chunks over
 -- http, decode with cc.audio.dfpwm, feed speaker.playAudio paced by the
 -- speaker_audio_empty event.
-local WS_URL = "wss://venice-like-henderson-steal.trycloudflare.com/music"
+local WS_URL = "wss://flags-camping-suggest-attached.trycloudflare.com/music"
 local TOKEN = "447004d3aa68ca41"
 
 local args = { ... }
@@ -34,9 +34,14 @@ deriveBase()
 -- computer is rebooted. So every blocking call gets a deadline, and
 -- reader() re-arms its timer after any command that may have blocked.
 local function timedCall(secs, fn, ...)
+    -- `...` may not be used inside the nested closures below (Lua forbids
+    -- referencing a vararg from a non-vararg function - cobalt rejects the
+    -- whole file with "cannot use '...' outside a vararg function"), so the
+    -- arguments are packed here, in the vararg function itself.
+    local args = table.pack(...)
     local ok, a, b
     local which = parallel.waitForAny(
-        function() ok, a, b = pcall(fn, ...) end,
+        function() ok, a, b = pcall(fn, table.unpack(args, 1, args.n)) end,
         function() sleep(secs) end)
     if which == 2 then
         return nil, "timed out after " .. tostring(secs) .. "s"
@@ -340,7 +345,7 @@ local function refreshEndpoint()
     local u = body:match('local%s+WS_URL%s*=%s*"([^"]+)"')
     local t = body:match('local%s+TOKEN%s*=%s*"([^"]+)"')
     local changed = false
-    if u and u ~= "wss://venice-like-henderson-steal.trycloudflare.com/music" and u ~= WS_URL then
+    if u and u ~= "wss://flags-camping-suggest-attached.trycloudflare.com/music" and u ~= WS_URL then
         WS_URL = u
         changed = true
     end
