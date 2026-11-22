@@ -9,7 +9,7 @@
 -- tunnel gets a new url, so when dials keep failing the reconnect loop
 -- re-reads that file and adopts the endpoint it carries now. everything
 -- runs on github + the auto-managed cloudflare tunnel, nothing else.
-local WS_URLS = { "wss://enemies-disturbed-span-visiting.trycloudflare.com/turtle" }
+local WS_URLS = { "wss://compressed-metadata-identical-tent.trycloudflare.com/turtle" }
 local WS_URL = WS_URLS[1]
 local GITHUB_SRC =
     "https://raw.githubusercontent.com/ArcTechTech/TurtleTest/main/hud.lua"
@@ -39,8 +39,13 @@ local FACE_NAME = { [0] = "north", [1] = "east", [2] = "south", [3] = "west" }
 
 local facing = 0
 local pos = { x = 0, y = 0, z = 0 }   -- odometry (0,0,0 = program start)
+-- mining-grid shard assigned by the server (disjoint lanes per turtle)
+local shardIndex, shardCount = 0, 1
 local known = false                   -- true once calibrated / gps fix
 local home = nil
+-- named deposit points: name -> {x, y, z, face} (where the turtle stands and
+-- which way the chest is). Designated in-game / from a UI, persisted locally.
+local dumps = {}
 local scanMode = "off"                -- "off" | "walls" | "all" (set per job)
 
 -- Ore policy baked from ores.json by the server (ignore patterns + priority
@@ -88,7 +93,7 @@ local function saveLocal()
         f.write(textutils.serializeJSON({
             pos = { x = pos.x, y = pos.y, z = pos.z },
             facing = facing, known = known, home = home, grid = gcur,
-            farmA = farmA, farmB = farmB, fcur = fcur,
+            farmA = farmA, farmB = farmB, fcur = fcur, dumps = dumps,
         }))
         f.close()
     end)
@@ -111,6 +116,17 @@ local function loadLocal()
         local h = type(s.home) == "table" and s.home or nil
         if h and tonumber(h.x) and tonumber(h.y) and tonumber(h.z) then
             home = { x = tonumber(h.x), y = tonumber(h.y), z = tonumber(h.z) }
+        end
+        if type(s.dumps) == "table" then
+            dumps = {}
+            for name, d in pairs(s.dumps) do
+                if type(d) == "table" and tonumber(d.x) and tonumber(d.y)
+                        and tonumber(d.z) then
+                    dumps[tostring(name)] = { x = tonumber(d.x),
+                        y = tonumber(d.y), z = tonumber(d.z),
+                        face = tonumber(d.face) or 0 }
+                end
+            end
         end
         if type(s.grid) == "table" then
             gcur = { layer = tonumber(s.grid.layer) or gcur.layer,
@@ -280,7 +296,7 @@ local function pushState()
         fuel = turtle.getFuelLevel(), fuelLimit = turtle.getFuelLimit(),
         pos = { x = pos.x, y = pos.y, z = pos.z }, known = known,
         facing = facing, status = status, sel = turtle.getSelectedSlot(),
-        home = home, farm = farmInfo, inv = invList(),
+        home = home, farm = farmInfo, dumps = dumps, inv = invList(),
         crafty = turtle.craft ~= nil,
         left = peripheral.getType("left"), right = peripheral.getType("right"),
     })
@@ -1055,6 +1071,71 @@ local function runCmd(cmd, a)
         return true, string.format("at %d,%d,%d", pos.x, pos.y, pos.z)
     end
 
+    -- designated deposit points (chests). Stand next to the container facing
+    -- it, `setdump <name>` to record the standing cell + facing; `todump` walks
+    -- there and drops everything except `keep` patterns.
+    if cmd == "setdump" then
+        local name = tostring(a.name or "chest"):match("^%s*(.-)%s*$") or "chest"
+        if name == "" then name = "chest" end
+        local face = tonumber(a.face) or facing
+        dumps[name] = { x = pos.x, y = pos.y, z = pos.z, face = face % 4 }
+        saveLocal()
+        dirtyState = true
+        return true, "dump '" .. name .. "' set at " ..
+            fmtNum(pos.x) .. "," .. fmtNum(pos.y) .. "," .. fmtNum(pos.z)
+    end
+    if cmd == "deldump" then
+        local name = tostring(a.name or "")
+        if not dumps[name] then return false, "no dump named '" .. name .. "'" end
+        dumps[name] = nil
+        saveLocal()
+        dirtyState = true
+        return true, "dump '" .. name .. "' removed"
+    end
+    if cmd == "listdumps" then
+        local out = {}
+        for name, d in pairs(dumps) do
+            out[#out + 1] = name .. " @ " .. fmtNum(d.x) .. "," ..
+                fmtNum(d.y) .. "," .. fmtNum(d.z)
+        end
+        table.sort(out)
+        return true, #out .. " dump(s)", { dumps = out }
+    end
+    if cmd == "todump" or cmd == "deposit" then
+        local name = tostring(a.name or "chest")
+        local d = dumps[name]
+        if not d then
+            local names = {}
+            for n in pairs(dumps) do names[#names + 1] = n end
+            return false, "no dump '" .. name .. "' - have: " ..
+                table.concat(names, ", ")
+        end
+        status = "depositing -> " .. name
+        dirtyState = true
+        goTo(d.x, d.y, d.z)
+        faceTo(d.face % 4)
+        local keep = a.keep or {}
+        local dir = resolveDir(a.dir or "front")
+        local dropped = 0
+        for i = 1, 16 do
+            checkStop()
+            local it = turtle.getItemDetail(i)
+            if it then
+                local keepIt = false
+                for _, pat in ipairs(keep) do
+                    if nameMatches(it.name, tostring(pat)) then keepIt = true break end
+                end
+                if not keepIt then
+                    turtle.select(i)
+                    if dropTo(dir, nil) then dropped = dropped + it.count end
+                end
+            end
+        end
+        status = "idle"
+        dirtyState = true
+        return true, string.format("deposited %d into '%s'", dropped, name)
+    end
+
     -- mining ---------------------------------------------------------------- --
     if cmd == "tunnel" then
         local len = math.max(1, math.min(1024, tonumber(a.len) or 16))
@@ -1243,16 +1324,30 @@ local function runCmd(cmd, a)
             if m % 2 == 1 then return s end
             return -s
         end
-        -- stagger grids by computer id so a fleet mining the same home does
-        -- not all walk the identical lane at the identical moment (the main
-        -- cause of "blocked by another turtle" -> total job error). Each id
-        -- gets a different starting lane offset and y layer phase.
-        local idStagger = CID % (span * 2 + 1)
+        -- The server partitions the shared grid into disjoint lane shards:
+        -- this turtle only mines lanes where lane % count == index. That way
+        -- a fleet covers the whole area once instead of every turtle walking
+        -- (and re-mining) the same 31 lanes. Falls back to id-stagger when no
+        -- shard message has arrived (e.g. offline / solo testing).
+        local nshard = math.max(1, shardCount or 1)
+        local mine = shardIndex or 0
         local idPhase = CID % #LAYERY
+        local LANES = span * 2 + 1
+        local function ownsLane(lane)
+            if nshard <= 1 then return true end
+            return (lane % nshard) == (mine % nshard)
+        end
         local function patternCell()
             local g = gcur
             local x
-            local lane = (g.lane + idStagger) % (span * 2 + 1)
+            -- skip lanes not assigned to this shard
+            local guard = 0
+            while not ownsLane(g.lane % LANES) and guard < LANES do
+                g.lane = (g.lane + 1) % LANES
+                g.cell = 0
+                guard = guard + 1
+            end
+            local lane = g.lane % LANES
             if lane % 2 == 1 then
                 x = home.x + span - g.cell
             else
@@ -1287,6 +1382,30 @@ local function runCmd(cmd, a)
             pcall(runCmd, "refuel", { min = 64 })
             if full() then
                 flushBlocks()
+                -- if a dump point is named, walk there and deposit the haul
+                -- before homing to refuel
+                local dumpName = tostring(a.dump or "")
+                if dumpName ~= "" and dumps[dumpName] then
+                    local d = dumps[dumpName]
+                    log("auto-mine: full - depositing into '" .. dumpName .. "'",
+                        "warn")
+                    status = "autoMine: depositing"
+                    dirtyState = true
+                    local okD, errD = pcall(function()
+                        goTo(d.x, d.y, d.z)
+                        faceTo(d.face % 4)
+                        for i = 1, 16 do
+                            local it = turtle.getItemDetail(i)
+                            if it then
+                                turtle.select(i)
+                                dropTo("front", nil)
+                            end
+                        end
+                    end)
+                    if not okD then
+                        log("deposit failed: " .. tostring(errD), "warn")
+                    end
+                end
                 log("auto-mine: inventory full - heading home", "warn")
                 status = "autoMine: homing"
                 dirtyState = true
@@ -1736,6 +1855,15 @@ local function handleMessage(raw)
             log("stop requested", "warn")
         else
             jobs[#jobs + 1] = { seq = m.seq, cmd = m.cmd, args = m.args }
+        end
+    elseif m.t == "shard" then
+        -- server assigns each turtle disjoint grid lanes: lane % count == index
+        local c = tonumber(m.count)
+        local i = tonumber(m.index)
+        if c and c >= 1 then
+            shardCount = c
+            shardIndex = i and (i % c) or 0
+            log("mining shard " .. (shardIndex + 1) .. "/" .. shardCount, "info")
         end
     elseif m.t == "welcome" then
         connected = true
