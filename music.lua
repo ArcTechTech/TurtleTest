@@ -9,7 +9,7 @@
 -- terreng/computercraft-streaming-music pattern: pull DFPWM chunks over
 -- http, decode with cc.audio.dfpwm, feed speaker.playAudio paced by the
 -- speaker_audio_empty event.
-local WS_URL = "wss://flags-camping-suggest-attached.trycloudflare.com/music"
+local WS_URL = "wss://phrase-officers-kodak-practices.trycloudflare.com/music"
 local TOKEN = "447004d3aa68ca41"
 
 local args = { ... }
@@ -59,6 +59,44 @@ local function rescanSpeakers()
 end
 rescanSpeakers()
 
+-- ------------------------------------------------------------ wake nodes --
+-- ComputerCraft Wake Nodes (ccwake): a wake_node attached to THIS computer
+-- keeps its chunk force-loaded, so playback survives the player walking
+-- away. Only stationary computers can host a node (the mod refuses turtle
+-- blocks), which is why this lives in the music agent and not in the turtle
+-- one. Reported in state so the dashboard can show it; rescanned on the
+-- slow heartbeat because nodes are placed/broken by hand.
+local wakeInfo = nil
+local function rescanWake()
+    wakeInfo = nil
+    for _, n in ipairs(peripheral.getNames()) do
+        local ok, ty = pcall(peripheral.getType, n)
+        if ok and type(ty) == "string" and ty:sub(1, 5) == "wake_" then
+            local okw, p = pcall(peripheral.wrap, n)
+            if okw and p then
+                if ty == "wake_controller" then
+                    -- controller: report how many nodes it can see
+                    local okc, nodes = pcall(p.listNodes)
+                    wakeInfo = { type = ty,
+                                 nodes = okc and type(nodes) == "table"
+                                         and #nodes or nil }
+                else
+                    -- wake_node / wake_node_advanced: id + chunk coverage
+                    local okg, info = pcall(p.getInfo)
+                    if okg and type(info) == "table" then
+                        info.type = ty
+                        wakeInfo = info
+                    else
+                        wakeInfo = { type = ty }
+                    end
+                end
+                break
+            end
+        end
+    end
+end
+rescanWake()
+
 local decoder = require "cc.audio.dfpwm".make_decoder()
 
 -- ------------------------------------------------------------ play state --
@@ -92,7 +130,7 @@ local function pushState()
         t = "state", name = NAME, label = os.getComputerLabel(),
         kind = "music", playing = playing, gen = curGen,
         offset = offset, len = tlen, track = tname, vol = vol,
-        speakers = #speakers,
+        speakers = #speakers, wake = wakeInfo,
     })
     dirtyState = false
 end
@@ -287,6 +325,9 @@ local function reader()
         elseif e == "timer" and ev[2] == timer then
             tick = tick + 1
             if #speakers == 0 then rescanSpeakers() end
+            -- wake nodes are placed/broken by hand: a slow rescan keeps the
+            -- reported chunk-load status current without per-tick probing
+            if tick % 10 == 0 then rescanWake() end
             -- heartbeat: the server drops units after 20s of silence, so
             -- push at least every 10s even when nothing is happening
             if dirtyState or playing or tick % 10 == 0 then
@@ -345,7 +386,7 @@ local function refreshEndpoint()
     local u = body:match('local%s+WS_URL%s*=%s*"([^"]+)"')
     local t = body:match('local%s+TOKEN%s*=%s*"([^"]+)"')
     local changed = false
-    if u and u ~= "wss://flags-camping-suggest-attached.trycloudflare.com/music" and u ~= WS_URL then
+    if u and u ~= "wss://phrase-officers-kodak-practices.trycloudflare.com/music" and u ~= WS_URL then
         WS_URL = u
         changed = true
     end
