@@ -9,7 +9,7 @@
 -- tunnel gets a new url, so when dials keep failing the reconnect loop
 -- re-reads that file and adopts the endpoint it carries now. everything
 -- runs on github + the auto-managed cloudflare tunnel, nothing else.
-local WS_URLS = { "wss://lawyers-considered-save-screen.trycloudflare.com/turtle" }
+local WS_URLS = { "wss://small-speeds-priest-string.trycloudflare.com/turtle" }
 local WS_URL = WS_URLS[1]
 local GITHUB_SRC =
     "https://raw.githubusercontent.com/ArcTechTech/TurtleTest/main/hud.lua"
@@ -42,6 +42,30 @@ local pos = { x = 0, y = 0, z = 0 }   -- odometry (0,0,0 = program start)
 local known = false                   -- true once calibrated / gps fix
 local home = nil
 local scanMode = "off"                -- "off" | "walls" | "all" (set per job)
+
+-- Ore policy baked from ores.json by the server (ignore patterns + priority
+-- weights). Raw template keeps the placeholder as a string so the test harness
+-- can load it unmodified; server.py replaces it with real JSON at download.
+local ORE_POLICY_JSON = "{\"ignore\":[\"minecraft:cobblestone\",\"minecraft:stone\",\"minecraft:gravel\"],\"priority\":{\"minecraft:ancient_debris\":100,\"minecraft:netherite\":100,\"diamond_ore\":80,\"deepslate_diamond_ore\":80,\"emerald_ore\":70,\"deepslate_emerald_ore\":70,\"gold_ore\":50,\"deepslate_gold_ore\":50,\"redstone_ore\":40,\"deepslate_redstone_ore\":40,\"lapis_ore\":35,\"deepslate_lapis_ore\":35,\"iron_ore\":30,\"deepslate_iron_ore\":30,\"copper_ore\":20,\"deepslate_copper_ore\":20,\"coal_ore\":10,\"deepslate_coal_ore\":10},\"colors\":{\"diamond\":\"#5ce1e6\",\"emerald\":\"#2ecc71\",\"redstone\":\"#e74c3c\",\"lapis\":\"#3b5bdb\",\"gold\":\"#f1c40f\",\"copper\":\"#e67e22\",\"iron\":\"#d9d9d9\",\"coal\":\"#4a4a4a\",\"ancient_debris\":\"#9b59b6\",\"quartz\":\"#ecf0f1\"}}"
+local ignoreOrePats = {}              -- {"minecraft:stone", "*cobble*", ...}
+local orePriority = {}                -- ore name -> weight (higher = first)
+local function applyOrePolicy(raw)
+    local p = raw and textutils.unserializeJSON(raw)
+    if type(p) ~= "table" then return end
+    if type(p.ignore) == "table" then
+        ignoreOrePats = {}
+        for _, pat in ipairs(p.ignore) do
+            ignoreOrePats[#ignoreOrePats + 1] = tostring(pat)
+        end
+    end
+    if type(p.priority) == "table" then
+        orePriority = {}
+        for k, v in pairs(p.priority) do
+            orePriority[k] = tonumber(v) or 0
+        end
+    end
+end
+applyOrePolicy(ORE_POLICY_JSON)
 
 -- block reporting (all map data lives on the server / your PC, not here)
 local pending = {}                    -- {x,y,z,nameIndex} batches
@@ -175,11 +199,31 @@ flushBlocks = function()
     push({ t = "blocks", names = names, add = add })
 end
 
---- Ore heuristic (vanilla …_ore plus modded names that contain "ore").
-local function isOreName(n)
+--- True when a block name matches any configured ignore pattern.
+local function isIgnoredOre(n)
     if type(n) ~= "string" then return false end
     local base = n:match("([^:]+)$") or n
+    for _, pat in ipairs(ignoreOrePats) do
+        if nameMatches(n, pat) or nameMatches(base, pat) then return true end
+    end
+    return false
+end
+
+--- Ore heuristic (vanilla …_ore plus modded names that contain "ore").
+--- Ignored ores are still reported to the map, but excluded from mining
+--- targets, legend counts and map highlighting.
+local function isOreName(n)
+    if type(n) ~= "string" then return false end
+    if isIgnoredOre(n) then return false end
+    local base = n:match("([^:]+)$") or n
     return base:find("ore", 1, true) ~= nil
+end
+
+--- Priority weight for an ore name (higher = chased first). 0 when unlisted.
+local function oreWeight(n)
+    if type(n) ~= "string" then return 0 end
+    local base = n:match("([^:]+)$") or n
+    return tonumber(orePriority[base]) or tonumber(orePriority[n]) or 0
 end
 
 local function addBlock(x, y, z, name)
@@ -200,7 +244,7 @@ local function addBlock(x, y, z, name)
         if not isOreName(name) then oreTargets[key] = nil end
     elseif isOreName(name) then
         oreTargets[key] = { x = math.floor(x), y = math.floor(y),
-            z = math.floor(z) }
+            z = math.floor(z), n = name, w = oreWeight(name) }
     end
     local ni = pendingNames[name]
     if not ni then
@@ -757,6 +801,31 @@ local function runCmd(cmd, a)
         dirtyState = true
         return true, "scanned surroundings"
     end
+    if cmd == "setore" then
+        -- live ore-policy reload from the dashboard: a.policy is the parsed
+        -- ores.json object. Re-classify every known cell so targets and the
+        -- next autoMine run immediately reflect ignore/priority changes.
+        applyOrePolicy(textutils.serializeJSON(a.policy or a))
+        local recount = 0
+        for key, name in pairs(seen) do
+            if isOreName(name) then
+                local p = oreTargets[key]
+                if p then p.w = oreWeight(name)
+                else
+                    local x, y, z = key:match("(-?%d+),(-?%d+),(-?%d+)")
+                    if x then
+                        oreTargets[key] = { x = tonumber(x), y = tonumber(y),
+                            z = tonumber(z), n = name, w = oreWeight(name) }
+                        recount = recount + 1
+                    end
+                end
+            else
+                oreTargets[key] = nil
+            end
+        end
+        return true, "ore policy updated", { targets = recount,
+            ignored = #ignoreOrePats }
+    end
 
     -- inventory ------------------------------------------------------------- --
     if cmd == "select" then
@@ -1021,6 +1090,27 @@ local function runCmd(cmd, a)
         scanMode = a.scan or "walls"
         local span = tonumber(a.span) or 15    -- half-width of the grid box
         if span < 1 then span = 1 elseif span > 64 then span = 64 end
+        -- per-job overrides: a.priority = { ["diamond_ore"] = 99, ... }
+        -- and a.ignore = { "iron_ore", ... } supplement the global policy
+        local jobPriority, jobIgnore = a.priority, a.ignore
+        local function jobIgnored(n)
+            if type(jobIgnore) == "table" then
+                local base = n:match("([^:]+)$") or n
+                for _, pat in ipairs(jobIgnore) do
+                    if nameMatches(n, tostring(pat)) or
+                       nameMatches(base, tostring(pat)) then return true end
+                end
+            end
+            return isIgnoredOre(n)
+        end
+        local function jobWeight(n)
+            if type(jobPriority) == "table" then
+                local base = n:match("([^:]+)$") or n
+                local v = tonumber(jobPriority[n]) or tonumber(jobPriority[base])
+                if v then return v end
+            end
+            return oreWeight(n)
+        end
         local steps = 0
         local fails = 0
         -- fresh detection only: old sightings may long be mined out
@@ -1032,12 +1122,19 @@ local function runCmd(cmd, a)
             return true
         end
         local function nearestOre()
-            local bx, by, bz, bd
-            for _, c in pairs(oreTargets) do
-                local d = math.abs(c.x - pos.x) + math.abs(c.y - pos.y)
-                    + math.abs(c.z - pos.z)
-                if not bd or d < bd then
-                    bx, by, bz, bd = c.x, c.y, c.z, d
+            local bx, by, bz, bd, bw
+            for key, c in pairs(oreTargets) do
+                -- re-apply job overrides at chase time (addBlock only knows
+                -- the global policy) so per-job priority/ignore really work
+                if not jobIgnored(c.n or (seen[key] or "")) then
+                    local d = math.abs(c.x - pos.x) + math.abs(c.y - pos.y)
+                        + math.abs(c.z - pos.z)
+                    local w = jobWeight(c.n or (seen[key] or ""))
+                    -- priority first (higher wins), distance breaks ties; a
+                    -- plain nearest rule is kept when no policy is configured
+                    if not bd or w > bw or (w == bw and d < bd) then
+                        bx, by, bz, bd, bw = c.x, c.y, c.z, d, w
+                    end
                 end
             end
             return bx, by, bz
