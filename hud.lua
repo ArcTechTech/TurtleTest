@@ -9,7 +9,7 @@
 -- tunnel gets a new url, so when dials keep failing the reconnect loop
 -- re-reads that file and adopts the endpoint it carries now. everything
 -- runs on github + the auto-managed cloudflare tunnel, nothing else.
-local WS_URLS = { "wss://vehicle-fantastic-remembered-picnic.trycloudflare.com/turtle" }
+local WS_URLS = { "wss://enemies-disturbed-span-visiting.trycloudflare.com/turtle" }
 local WS_URL = WS_URLS[1]
 local GITHUB_SRC =
     "https://raw.githubusercontent.com/ArcTechTech/TurtleTest/main/hud.lua"
@@ -466,6 +466,12 @@ local function updatePos(dir)
     dirtyState = true
 end
 
+-- Active de-clustering: when a peer blocks the path, step sideways to a free
+-- cell instead of waiting in a conga line. Defined as a forward local because
+-- it calls move() and move() calls it back (guarded by `dodging`).
+local dodgePeer
+local dodging = false
+
 --- Move one block. autoDig breaks whatever is in the way (except behind).
 local function move(dir, autoDig)
     checkStop()
@@ -474,19 +480,27 @@ local function move(dir, autoDig)
     if not ok and dir ~= "back" then
         local d = dir == "forward" and "front" or dir
         if peerInDir(d) then
-            -- another turtle is in the way: never dig a peer - wait for it
-            -- to clear (peers are moving), and if it stays fail cleanly so
-            -- the job skips the cell instead of tearing the peer apart
-            local waited = 0
-            while peerInDir(d) and waited < 3 do
-                sleep(0.5)
-                waited = waited + 0.5
-                checkStop()
+            -- another turtle is in the way: NEVER dig a peer. During
+            -- navigation (autoDig) prefer to step aside (de-cluster) so a
+            -- fleet mining one home does not deadlock in a conga line. Manual
+            -- driving (autoDig=false) just waits then fails cleanly, which
+            -- keeps hands-on control predictable.
+            if autoDig and d == "front" and dodgePeer and dodgePeer() then
+                -- stepped aside into a cleared cell; the caller's goTo loop
+                -- recomputes from the new position. Soft "dodged" signal.
+                ok, err = false, "dodged peer"
+            else
+                local waited = 0
+                while peerInDir(d) and waited < 3 do
+                    sleep(0.5)
+                    waited = waited + 0.5
+                    checkStop()
+                end
+                if peerInDir(d) then
+                    return false, "blocked by another turtle"
+                end
+                ok, err = turtle[dir]()          -- peer moved off, try again
             end
-            if peerInDir(d) then
-                return false, "blocked by another turtle"
-            end
-            ok, err = turtle[dir]()          -- peer moved off, try again
         elseif autoDig and err and
             tostring(err):lower():find("obstruct", 1, true) then
             -- CC reports a blocked path as "Movement obstructed"
@@ -494,6 +508,12 @@ local function move(dir, autoDig)
             checkStop()
             ensureFuel()
             ok, err = turtle[dir]()
+            if not ok and dodgePeer and dodgePeer() then
+                -- the way is still blocked (undiggable / bedrock / a peer
+                -- that shifted): step into an already-cleared cell beside us
+                -- rather than deadlock. Callers recompute from the new pos.
+                ok, err = false, "dodged obstacle"
+            end
         end
     end
     if not ok then
@@ -533,9 +553,67 @@ local function move(dir, autoDig)
 end
 
 --- Move and dig through obstacles (used by navigation / mining).
+--- On a peer block, move() first sidesteps (dodgePeer); retry from the new
+--- position so homing / goto / manual driving all flow around the peer instead
+--- of aborting the job. Bounded to avoid a true deadlock.
 local function moveStrict(dir)
-    local ok, err = move(dir, true)
-    if not ok then error(err or "cannot move", 0) end
+    for attempt = 1, 4 do
+        local ok, err = move(dir, true)
+        if ok then return end
+        local em = tostring(err or "")
+        if em:find("dodged", 1, true) then
+            -- we slipped into a cleared cell beside the obstacle; goTo's
+            -- while loop recomputes from the new pos. Not a failure.
+            return
+        end
+        if em:find("blocked by another turtle", 1, true) and attempt < 4 then
+            sleep(0.3)
+        else
+            error(em ~= "" and em or "cannot move", 0)
+        end
+    end
+end
+
+--- De-cluster: a peer is directly in front. Try to slip around it by stepping
+--- to a free side (left / right / up / down), so a fleet sharing a work area
+--- or heading home does not deadlock in a conga line. Returns true if we moved
+--- somewhere useful (the caller's goTo loop then recomputes from the new pos).
+--- Uses the raw turtle API + updatePos to avoid recursing into move().
+dodgePeer = function()
+    if dodging then return false end
+    dodging = true
+    local moved = false
+    local orig = facing
+    -- try up / down directly (inspect first so we never climb into a peer)
+    for _, dir in ipairs({ "up", "down" }) do
+        local okI, p = inspectFn(dir)()
+        local peer = okI and type(p) == "table" and type(p.name) == "string"
+            and p.name:find("computercraft:turtle", 1, true)
+        if not peer and turtle[dir]() then
+            updatePos(dir)
+            moved = true
+            break
+        end
+    end
+    -- try left / right: turn, inspect front, move if clear, restore facing
+    if not moved then
+        for _, turn in ipairs({ turnLeft, turnRight }) do
+            turn()
+            local okI, p = turtle.inspect()
+            local peer = okI and type(p) == "table" and type(p.name) == "string"
+                and p.name:find("computercraft:turtle", 1, true)
+            if not peer and turtle.forward() then
+                updatePos("forward")
+                moved = true
+            end
+            if moved then break end
+            -- restore this turn before trying the other side
+            if turn == turnLeft then turnRight() else turnLeft() end
+        end
+    end
+    faceTo(orig)
+    dodging = false
+    return moved
 end
 
 -- ------------------------------------------------------------- navigation --
@@ -546,13 +624,27 @@ end
 
 local function goTo(x, y, z)
     local guard = 0
-    while pos.y ~= y do
-        moveStrict(pos.y < y and "up" or "down")
+    -- loop until we truly arrive: a peer dodge can change y mid-walk, so the
+    -- y/x/z passes may need to repeat after a detour
+    repeat
         guard = guard + 1
-        if guard > 512 then error("goto failed (y)", 0) end
-    end
-    while pos.x ~= x do stepTo(pos.x < x and 1 or 3) end
-    while pos.z ~= z do stepTo(pos.z < z and 2 or 0) end
+        if guard > 600 then error("goto failed (loop)", 0) end
+        while pos.y ~= y do
+            moveStrict(pos.y < y and "up" or "down")
+            guard = guard + 1
+            if guard > 600 then error("goto failed (y)", 0) end
+        end
+        while pos.x ~= x do
+            stepTo(pos.x < x and 1 or 3)
+            guard = guard + 1
+            if guard > 600 then error("goto failed (x)", 0) end
+        end
+        while pos.z ~= z do
+            stepTo(pos.z < z and 2 or 0)
+            guard = guard + 1
+            if guard > 600 then error("goto failed (z)", 0) end
+        end
+    until pos.x == x and pos.y == y and pos.z == z
 end
 
 -- ------------------------------------------------------- side helpers ------
@@ -1151,16 +1243,24 @@ local function runCmd(cmd, a)
             if m % 2 == 1 then return s end
             return -s
         end
+        -- stagger grids by computer id so a fleet mining the same home does
+        -- not all walk the identical lane at the identical moment (the main
+        -- cause of "blocked by another turtle" -> total job error). Each id
+        -- gets a different starting lane offset and y layer phase.
+        local idStagger = CID % (span * 2 + 1)
+        local idPhase = CID % #LAYERY
         local function patternCell()
             local g = gcur
             local x
-            if g.lane % 2 == 1 then
+            local lane = (g.lane + idStagger) % (span * 2 + 1)
+            if lane % 2 == 1 then
                 x = home.x + span - g.cell
             else
                 x = home.x - span + g.cell
             end
-            return x, home.y + (LAYERY[g.layer + 1] or 0),
-                   home.z + zig(g.lane)
+            local layer = (g.layer + idPhase) % #LAYERY
+            return x, home.y + (LAYERY[layer + 1] or 0),
+                   home.z + zig(lane)
         end
         local function advance()
             local g = gcur
@@ -1212,8 +1312,15 @@ local function runCmd(cmd, a)
                     -- recording it clears the target and corrects the map
                     addBlock(ox, oy, oz, "minecraft:air")
                 else
-                    oreTargets[bkey(ox, oy, oz)] = nil
-                    log("ore unreachable: " .. tostring(errOre), "warn")
+                    local em = tostring(errOre)
+                    -- a peer turtle is NEVER a fatal error: leave the target
+                    -- for a later pass instead of aborting the whole job
+                    if em:find("blocked by another turtle", 1, true) then
+                        sleep(1)
+                    else
+                        oreTargets[bkey(ox, oy, oz)] = nil
+                    end
+                    log("ore deferred: " .. em, "warn")
                 end
             else
                 local tx, ty, tz = patternCell()
@@ -1236,13 +1343,22 @@ local function runCmd(cmd, a)
                     if okM then
                         fails = 0
                     else
-                        -- unbreakable cell: skip it, but bail out instead of
-                        -- spinning in place if the pattern can't progress
-                        fails = fails + 1
-                        if fails > 4 then
-                            return false, "grid blocked: " .. tostring(errM)
+                        local em = tostring(errM)
+                        if em:find("blocked by another turtle", 1, true) then
+                            -- a peer is transient: skip the cell, do NOT count
+                            -- it as a failure. A fleet sharing a home would
+                            -- otherwise collide 4x and abort into "error".
+                            advance()
+                            sleep(0.5)
+                        else
+                            -- genuine unbreakable cell: skip it, but bail out
+                            -- instead of spinning in place if it can't progress
+                            fails = fails + 1
+                            if fails > 4 then
+                                return false, "grid blocked: " .. em
+                            end
+                            advance()
                         end
-                        advance()
                     end
                 end
             end
