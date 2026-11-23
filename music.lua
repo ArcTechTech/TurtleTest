@@ -9,7 +9,7 @@
 -- terreng/computercraft-streaming-music pattern: pull DFPWM chunks over
 -- http, decode with cc.audio.dfpwm, feed speaker.playAudio paced by the
 -- speaker_audio_empty event.
-local WS_URL = "wss://great-strength-depend-facility.trycloudflare.com/music"
+local WS_URL = "wss://fabric-care-awareness-praise.trycloudflare.com/music"
 local TOKEN = "447004d3aa68ca41"
 
 local args = { ... }
@@ -58,6 +58,17 @@ local function rescanSpeakers()
     speakers = { peripheral.find("speaker") }
 end
 rescanSpeakers()
+
+-- monitor display (optional): the first attached monitor. Works with basic
+-- (monochrome) monitors - frames are pre-rendered ASCII from the server.
+local monitor = peripheral.find("monitor")
+local monW, monH = 0, 0
+if monitor then
+    monW, monH = monitor.getSize()
+    pcall(function() monitor.setTextScale(1) end)
+    monW, monH = monitor.getSize()
+    pcall(function() monitor.clear() end)
+end
 
 -- ------------------------------------------------------------ wake nodes --
 -- ComputerCraft Wake Nodes (ccwake): a wake_node attached to THIS computer
@@ -112,6 +123,24 @@ local ws = nil                -- active websocket (set per session)
 local gotWelcome = false      -- set once the server welcomes a session
 local resumeAt = nil          -- byte offset to resume after a reconnect
 
+-- video playback state: frame index is derived from the audio byte offset so
+-- picture and sound stay in sync (dfpwm = 8 samples/byte @ 44.1kHz).
+local videoFrames = 0         -- total frames available on the server
+local videoFps = 8
+local videoW, videoH = monW, monH
+local frameCache = {}         -- index -> frame string (small window)
+local lastFrame = -1
+local videoHandle = nil       -- open frame-fetch http handle
+
+-- Frame index from audio offset: bytes-per-frame = (44100/8) / fps.
+local function frameIndex()
+    if videoFrames <= 0 or not monitor then return nil end
+    local bpf = (44100 / 8) / videoFps
+    local i = math.floor(offset / bpf)
+    if i < 0 then i = 0 elseif i >= videoFrames then i = videoFrames - 1 end
+    return i
+end
+
 local outbox = {}
 local function push(o)
     outbox[#outbox + 1] = o
@@ -131,6 +160,9 @@ local function pushState()
         kind = "music", playing = playing, gen = curGen,
         offset = offset, len = tlen, track = tname, vol = vol,
         speakers = #speakers, wake = wakeInfo,
+        monitor = monitor and { w = videoW, h = videoH } or nil,
+        video = { frames = videoFrames, fps = videoFps,
+                  frame = lastFrame >= 0 and lastFrame or nil },
     })
     dirtyState = false
 end
@@ -171,7 +203,40 @@ local function haltPlayback()
     playing = false
     closeStream()
     for _, sp in ipairs(speakers) do pcall(sp.stop) end
+    if videoHandle then pcall(videoHandle.close) videoHandle = nil end
+    if monitor then pcall(function() monitor.clear() end) end
+    lastFrame = -1
     os.queueEvent("music_wake")
+end
+
+-- --------------------------------------------------------- video display --
+-- Fetch one frame over HTTP (small, cached) and paint it to the monitor.
+-- Frames are plain text of exactly w*h characters; we write them row by row.
+local function paintFrame(idx)
+    if not monitor or idx == lastFrame then return end
+    local data = frameCache[idx]
+    if not data then
+        if videoHandle then pcall(videoHandle.close) videoHandle = nil end
+        local url = BASE .. "/video/frame?token=" ..
+            textutils.urlEncode(TOKEN) .. "&i=" .. tostring(idx)
+        local h, err = timedCall(6, http.get, url)
+        if not h then return end
+        videoHandle = h
+        data = h.readAll()
+        pcall(h.close)
+        videoHandle = nil
+        if not data or #data < videoW * videoH then return end
+        -- one-slot cache: consecutive frames are fetched one at a time
+        frameCache = { [idx] = data }
+    end
+    local ok = pcall(function()
+        monitor.setCursorPos(1, 1)
+        for y = 0, videoH - 1 do
+            monitor.setCursorPos(1, y + 1)
+            monitor.write(data:sub(y * videoW + 1, (y + 1) * videoW))
+        end
+    end)
+    if ok then lastFrame = idx end
 end
 
 -- ---------------------------------------------------------- player loop --
@@ -223,6 +288,22 @@ local function player()
     end
 end
 
+-- Video runs as its own coroutine so a slow HTTP frame fetch or monitor write
+-- never delays the audio. It follows `offset`, so picture tracks sound.
+local function videoPlayer()
+    local timer = os.startTimer(0.05)
+    while true do
+        local ev = { os.pullEvent() }
+        if ev[1] == "timer" and ev[2] == timer then
+            if playing and monitor then
+                local fi = frameIndex()
+                if fi then pcall(paintFrame, fi) end
+            end
+            timer = os.startTimer(0.05)
+        end
+    end
+end
+
 -- ----------------------------------------------------------- commands ----
 local function handleCmd(cmd, a)
     a = a or {}
@@ -235,13 +316,23 @@ local function handleCmd(cmd, a)
         tname = tostring(a.name or "")
         vol = tonumber(a.vol) or vol
         offset = 0
+        -- video metadata from the server (frame count / grid / fps)
+        if type(a.video) == "table" then
+            videoFrames = tonumber(a.video.frames) or 0
+            videoFps = tonumber(a.video.fps) or 8
+            videoW = tonumber(a.video.w) or monW
+            videoH = tonumber(a.video.h) or monH
+        else
+            videoFrames = 0
+            videoW, videoH = monW, monH
+        end
+        frameCache, lastFrame = {}, -1
         local ok, err = openStream(0)
         if not ok then return false, err end
-        if #speakers == 0 then
+        if #speakers == 0 and not monitor then
             rescanSpeakers()
-            if #speakers == 0 then
-                haltPlayback()
-                return false, "no speakers attached"
+            if #speakers == 0 and not monitor then
+                return false, "no speakers/monitor attached"
             end
         end
         playing = true
@@ -386,7 +477,7 @@ local function refreshEndpoint()
     local u = body:match('local%s+WS_URL%s*=%s*"([^"]+)"')
     local t = body:match('local%s+TOKEN%s*=%s*"([^"]+)"')
     local changed = false
-    if u and u ~= "wss://great-strength-depend-facility.trycloudflare.com/music" and u ~= WS_URL then
+    if u and u ~= "wss://fabric-care-awareness-praise.trycloudflare.com/music" and u ~= WS_URL then
         WS_URL = u
         changed = true
     end
@@ -408,7 +499,7 @@ local function session()
     if not w then error(tostring(err), 0) end
     ws = w
     waitForWelcome()
-    parallel.waitForAny(reader, player)
+    parallel.waitForAny(reader, player, videoPlayer)
 end
 
 -- ------------------------------------------------------------------ run --
