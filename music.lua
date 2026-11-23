@@ -9,7 +9,7 @@
 -- terreng/computercraft-streaming-music pattern: pull DFPWM chunks over
 -- http, decode with cc.audio.dfpwm, feed speaker.playAudio paced by the
 -- speaker_audio_empty event.
-local WS_URL = "wss://ten-site-system-enquiries.trycloudflare.com/music"
+local WS_URL = "wss://gcc-beast-witness-adjustment.trycloudflare.com/music"
 local TOKEN = "447004d3aa68ca41"
 
 local args = { ... }
@@ -492,7 +492,7 @@ local function refreshEndpoint()
     local u = body:match('local%s+WS_URL%s*=%s*"([^"]+)"')
     local t = body:match('local%s+TOKEN%s*=%s*"([^"]+)"')
     local changed = false
-    if u and u ~= "wss://ten-site-system-enquiries.trycloudflare.com/music" and u ~= WS_URL then
+    if u and u ~= "wss://gcc-beast-witness-adjustment.trycloudflare.com/music" and u ~= WS_URL then
         WS_URL = u
         changed = true
     end
