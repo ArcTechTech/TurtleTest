@@ -9,7 +9,7 @@
 -- terreng/computercraft-streaming-music pattern: pull DFPWM chunks over
 -- http, decode with cc.audio.dfpwm, feed speaker.playAudio paced by the
 -- speaker_audio_empty event.
-local WS_URL = "wss://metropolitan-settings-type-persons.trycloudflare.com/music"
+local WS_URL = "wss://variable-kid-def-saint.trycloudflare.com/music"
 local TOKEN = "447004d3aa68ca41"
 
 local args = { ... }
@@ -126,6 +126,7 @@ local resumeAt = nil          -- byte offset to resume after a reconnect
 -- video playback state: frame index is derived from the audio byte offset so
 -- picture and sound stay in sync (dfpwm = 8 samples/byte @ 44.1kHz).
 local videoFrames = 0         -- total frames available on the server
+local mediaMode = "video"     -- "video" (audio+monitor) | "music" (audio only)
 local videoFps = 8
 local videoW, videoH = monW, monH
 local frameCache = {}         -- index -> frame string (small window)
@@ -163,6 +164,7 @@ local function pushState()
         monitor = monitor and { w = videoW, h = videoH } or nil,
         video = { frames = videoFrames, fps = videoFps,
                   frame = lastFrame >= 0 and lastFrame or nil },
+        mediaMode = mediaMode,
     })
     dirtyState = false
 end
@@ -295,7 +297,7 @@ local function videoPlayer()
     while true do
         local ev = { os.pullEvent() }
         if ev[1] == "timer" and ev[2] == timer then
-            if playing and monitor then
+            if playing and monitor and mediaMode ~= "music" then
                 local fi = frameIndex()
                 if fi then pcall(paintFrame, fi) end
             end
@@ -317,6 +319,7 @@ local function handleCmd(cmd, a)
         vol = tonumber(a.vol) or vol
         offset = 0
         -- video metadata from the server (frame count / grid / fps)
+        if a.mode then mediaMode = tostring(a.mode) end
         if type(a.video) == "table" then
             videoFrames = tonumber(a.video.frames) or 0
             videoFps = tonumber(a.video.fps) or 8
@@ -325,6 +328,9 @@ local function handleCmd(cmd, a)
         else
             videoFrames = 0
             videoW, videoH = monW, monH
+        end
+        if mediaMode == "music" and monitor then
+            pcall(function() monitor.clear() end)
         end
         frameCache, lastFrame = {}, -1
         local ok, err = openStream(0)
@@ -370,6 +376,15 @@ local function handleCmd(cmd, a)
         vol = math.max(0, math.min(3, v))
         dirtyState = true
         return true, "volume " .. string.format("%.2f", vol)
+    elseif cmd == "media_mode" then
+        mediaMode = tostring(a.mode or "video")
+        if mediaMode == "music" and monitor then
+            pcall(function() monitor.clear() end)
+        end
+        lastFrame = -1
+        frameCache = {}
+        dirtyState = true
+        return true, "mode: " .. mediaMode
     elseif cmd == "music_scan" then
         rescanSpeakers()
         dirtyState = true
@@ -477,7 +492,7 @@ local function refreshEndpoint()
     local u = body:match('local%s+WS_URL%s*=%s*"([^"]+)"')
     local t = body:match('local%s+TOKEN%s*=%s*"([^"]+)"')
     local changed = false
-    if u and u ~= "wss://metropolitan-settings-type-persons.trycloudflare.com/music" and u ~= WS_URL then
+    if u and u ~= "wss://variable-kid-def-saint.trycloudflare.com/music" and u ~= WS_URL then
         WS_URL = u
         changed = true
     end
