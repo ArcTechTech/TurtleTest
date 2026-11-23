@@ -9,7 +9,7 @@
 -- tunnel gets a new url, so when dials keep failing the reconnect loop
 -- re-reads that file and adopts the endpoint it carries now. everything
 -- runs on github + the auto-managed cloudflare tunnel, nothing else.
-local WS_URLS = { "wss://bridges-respect-junction-bee.trycloudflare.com/turtle" }
+local WS_URLS = { "wss://great-strength-depend-facility.trycloudflare.com/turtle" }
 local WS_URL = WS_URLS[1]
 local GITHUB_SRC =
     "https://raw.githubusercontent.com/ArcTechTech/TurtleTest/main/hud.lua"
@@ -46,6 +46,48 @@ local home = nil
 -- named deposit points: name -> {x, y, z, face} (where the turtle stands and
 -- which way the chest is). Designated in-game / from a UI, persisted locally.
 local dumps = {}
+-- pending redstone pulses: timerId -> {side, level} (turn off when timer fires)
+local redTimers = {}
+
+-- Redstone helpers. CC:Tweaked provides setOutput (boolean) and
+-- setAnalogOutput (0..15). Sides accept both turtle-relative and world names.
+local RS_SIDES = { "front", "back", "left", "right", "top", "bottom" }
+local function normSide(s)
+    s = tostring(s or "front"):lower()
+    local map = { up = "top", down = "bottom", north = "front",
+                  south = "back", east = "right", west = "left" }
+    return map[s] or s
+end
+local function redSet(side, level)
+    side = normSide(side)
+    local lv = tonumber(level)
+    local ok = pcall(function()
+        if lv then
+            if redstone.setAnalogOutput then
+                redstone.setAnalogOutput(side, math.max(0, math.min(15, math.floor(lv))))
+            else
+                redstone.setOutput(side, lv > 0)
+            end
+        else
+            local on = (level == true) or (level == nil) or
+                (tostring(level):lower() == "true")
+            redstone.setOutput(side, on)
+        end
+    end)
+    if ok then dirtyState = true end
+    return ok
+end
+local function redState()
+    local out = {}
+    for _, s in ipairs(RS_SIDES) do
+        local ok, lv = pcall(function()
+            return redstone.getAnalogOutput and redstone.getAnalogOutput(s) or
+                (redstone.getOutput(s) and 15 or 0)
+        end)
+        out[s] = ok and tonumber(lv) or 0
+    end
+    return out
+end
 local scanMode = "off"                -- "off" | "walls" | "all" (set per job)
 
 -- Ore policy baked from ores.json by the server (ignore patterns + priority
@@ -297,6 +339,7 @@ local function pushState()
         pos = { x = pos.x, y = pos.y, z = pos.z }, known = known,
         facing = facing, status = status, sel = turtle.getSelectedSlot(),
         home = home, farm = farmInfo, dumps = dumps, inv = invList(),
+        redstone = redState(),
         crafty = turtle.craft ~= nil,
         left = peripheral.getType("left"), right = peripheral.getType("right"),
     })
@@ -1074,6 +1117,26 @@ local function runCmd(cmd, a)
     -- designated deposit points (chests). Stand next to the container facing
     -- it, `setdump <name>` to record the standing cell + facing; `todump` walks
     -- there and drops everything except `keep` patterns.
+    if cmd == "setredstone" then
+        local ok = redSet(a.side, a.level ~= nil and a.level or true)
+        if not ok then return false, "redstone API not available" end
+        return true, "redstone " .. normSide(a.side) .. " = " ..
+            tostring(a.level ~= nil and a.level or true)
+    end
+    if cmd == "redpulse" then
+        -- pulse a side on then auto-off after a delay (seconds, 0.05..30)
+        local secs = tonumber(a.secs) or 0.5
+        if secs < 0.05 then secs = 0.05 elseif secs > 30 then secs = 30 end
+        local side = normSide(a.side)
+        local level = a.level ~= nil and a.level or true
+        redSet(side, level)
+        local tid = os.startTimer(secs)
+        redTimers[tid] = { side = side, level = false }
+        return true, string.format("pulsing %s for %.2fs", side, secs)
+    end
+    if cmd == "getredstone" then
+        return true, "ok", { redstone = redState() }
+    end
     if cmd == "setdump" then
         local name = tostring(a.name or "chest"):match("^%s*(.-)%s*$") or "chest"
         if name == "" then name = "chest" end
@@ -1886,6 +1949,13 @@ local function reader()
         local ev = { os.pullEvent() }
         local e = ev[1]
         if e == "hud_flush" then
+            if not flushOutbox() then return end
+        elseif e == "timer" and redTimers[ev[2]] then
+            -- a redstone pulse finished: turn the side back off
+            local p = redTimers[ev[2]]
+            redTimers[ev[2]] = nil
+            redSet(p.side, p.level)
+            pushState()
             if not flushOutbox() then return end
         elseif e == "timer" and ev[2] == timer then
             tick = tick + 1

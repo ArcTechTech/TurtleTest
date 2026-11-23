@@ -13,7 +13,7 @@
 -- tunnel gets a new url, so when dials keep failing the reconnect loop
 -- re-reads that file and adopts the endpoint it carries now. everything
 -- runs on github + the auto-managed cloudflare tunnel, nothing else.
-local WS_URLS = { "wss://bridges-respect-junction-bee.trycloudflare.com/android" }
+local WS_URLS = { "wss://great-strength-depend-facility.trycloudflare.com/android" }
 local WS_URL = WS_URLS[1]
 local GITHUB_SRC =
     "https://raw.githubusercontent.com/ArcTechTech/TurtleTest/main/android.lua"

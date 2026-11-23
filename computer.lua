@@ -15,7 +15,7 @@
 -- computercraft:computer_* blocks, and turtles only see left/right upgrades.
 -- No world interaction, no commands, no keys - just a 10s heartbeat so the
 -- server (which drops units after 20s of silence) keeps it online.
-local WS_URL = "wss://bridges-respect-junction-bee.trycloudflare.com/computer"
+local WS_URL = "wss://great-strength-depend-facility.trycloudflare.com/computer"
 local TOKEN = "447004d3aa68ca41"
 
 local args = { ... }
@@ -101,11 +101,51 @@ end
 
 local gotWelcome = false   -- set once the server welcomes a session
 
+-- Redstone output support (same surface as the turtle agent).
+local redTimers = {}
+local RS_SIDES = { "front", "back", "left", "right", "top", "bottom" }
+local function normSide(s)
+    s = tostring(s or "front"):lower()
+    local map = { up = "top", down = "bottom", north = "front",
+                  south = "back", east = "right", west = "left" }
+    return map[s] or s
+end
+local function redSet(side, level)
+    side = normSide(side)
+    local lv = tonumber(level)
+    local ok = pcall(function()
+        if lv then
+            if redstone.setAnalogOutput then
+                redstone.setAnalogOutput(side, math.max(0, math.min(15, math.floor(lv))))
+            else
+                redstone.setOutput(side, lv > 0)
+            end
+        else
+            local on = (level == true) or (level == nil) or
+                (tostring(level):lower() == "true")
+            redstone.setOutput(side, on)
+        end
+    end)
+    return ok
+end
+local function redState()
+    local out = {}
+    for _, s in ipairs(RS_SIDES) do
+        local ok, lv = pcall(function()
+            return redstone.getAnalogOutput and redstone.getAnalogOutput(s) or
+                (redstone.getOutput(s) and 15 or 0)
+        end)
+        out[s] = ok and tonumber(lv) or 0
+    end
+    return out
+end
+
 local function pushState()
     push({
         t = "state", name = NAME, label = os.getComputerLabel(),
         kind = "computer", status = statusText(),
         wake = wakeInfo,
+        redstone = redState(),
         cid = CID,
     })
 end
@@ -132,10 +172,26 @@ local function handleMessage(raw)
         pushState()
         flushOutbox()
     elseif m.t == "cmd" then
-        -- the HUD never sends commands to computer units, but ack anything
-        -- that arrives so the server's pending-request table cannot leak
-        push({ t = "result", seq = m.seq, ok = false,
-               msg = "computer agent accepts no commands" })
+        -- computer units accept only redstone control; everything else is
+        -- acked as unsupported so the server's pending table cannot leak
+        local ok, msg, data = false, "unsupported command", nil
+        local c, a = tostring(m.cmd or ""), m.args or {}
+        if c == "setredstone" then
+            ok, msg = redSet(a.side, a.level ~= nil and a.level or true)
+            if ok then msg = "redstone " .. normSide(a.side) .. " set"
+            else msg = "redstone API not available" end
+        elseif c == "redpulse" then
+            local secs = tonumber(a.secs) or 0.5
+            if secs < 0.05 then secs = 0.05 elseif secs > 30 then secs = 30 end
+            local side = normSide(a.side)
+            redSet(side, a.level ~= nil and a.level or true)
+            redTimers[os.startTimer(secs)] = { side = side, level = false }
+            ok, msg = true, string.format("pulsing %s for %.2fs", side, secs)
+        elseif c == "getredstone" then
+            ok, msg, data = true, "ok", { redstone = redState() }
+        end
+        push({ t = "result", seq = m.seq, ok = ok, msg = msg, data = data })
+        if ok then pushState() end
         flushOutbox()
     elseif m.t == "error" then
         error(tostring(m.msg), 0)
@@ -149,6 +205,12 @@ local function reader()
         local ev = { os.pullEvent() }
         local e = ev[1]
         if e == "computer_flush" then
+            if not flushOutbox() then return end
+        elseif e == "timer" and redTimers[ev[2]] then
+            local p = redTimers[ev[2]]
+            redTimers[ev[2]] = nil
+            redSet(p.side, p.level)
+            pushState()
             if not flushOutbox() then return end
         elseif e == "timer" and ev[2] == timer then
             tick = tick + 1
@@ -209,7 +271,7 @@ local function refreshEndpoint()
     local u = body:match('local%s+WS_URL%s*=%s*"([^"]+)"')
     local t = body:match('local%s+TOKEN%s*=%s*"([^"]+)"')
     local changed = false
-    if u and u ~= "wss://bridges-respect-junction-bee.trycloudflare.com/computer" and u ~= WS_URL then
+    if u and u ~= "wss://great-strength-depend-facility.trycloudflare.com/computer" and u ~= WS_URL then
         WS_URL = u
         changed = true
     end
