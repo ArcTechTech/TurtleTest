@@ -9,7 +9,7 @@
 -- tunnel gets a new url, so when dials keep failing the reconnect loop
 -- re-reads that file and adopts the endpoint it carries now. everything
 -- runs on github + the auto-managed cloudflare tunnel, nothing else.
-local WS_URLS = { "wss://gcc-beast-witness-adjustment.trycloudflare.com/turtle" }
+local WS_URLS = { "wss://warned-graphs-cohen-eos.trycloudflare.com/turtle" }
 local WS_URL = WS_URLS[1]
 local GITHUB_SRC =
     "https://raw.githubusercontent.com/ArcTechTech/TurtleTest/main/hud.lua"
@@ -113,6 +113,39 @@ local function applyOrePolicy(raw)
     end
 end
 applyOrePolicy(ORE_POLICY_JSON)
+
+-- Dig policy: block names the turtle must NEVER mine. Baked from dig.json by
+-- the server; enforced in digBlock() (the one choke point for every dig).
+local DIG_POLICY_JSON = "{\"protected\":[\"minecraft:wooden_planks\",\"minecraft:oak_planks\",\"minecraft:chest\",\"minecraft:trapped_chest\",\"minecraft:barrel\",\"minecraft:obsidian\",\"computercraft:turtle*\",\"computercraft:computer*\"]}"
+local protectedPats = {}
+local function applyDigPolicy(raw)
+    local p = raw and textutils.unserializeJSON(raw)
+    if type(p) ~= "table" or type(p.protected) ~= "table" then return end
+    protectedPats = {}
+    for _, pat in ipairs(p.protected) do
+        protectedPats[#protectedPats + 1] = tostring(pat):lower()
+    end
+end
+applyDigPolicy(DIG_POLICY_JSON)
+
+-- case-insensitive exact / * wildcard match on a full block name
+local function patMatch(name, pat)
+    if not pat or pat == "" then return false end
+    if pat:find("*", 1, true) then
+        local escaped = pat:gsub("([%^%$%(%)%%%.%[%]%+%-%?])", "%%%1")
+        return name:match("^" .. escaped:gsub("%*", ".*") .. "$") ~= nil
+    end
+    return name == pat
+end
+
+local function isProtected(name)
+    if type(name) ~= "string" then return false end
+    local n = name:lower()
+    for _, pat in ipairs(protectedPats) do
+        if patMatch(n, pat) then return true end
+    end
+    return false
+end
 
 -- block reporting (all map data lives on the server / your PC, not here)
 local pending = {}                    -- {x,y,z,nameIndex} batches
@@ -340,6 +373,7 @@ local function pushState()
         facing = facing, status = status, sel = turtle.getSelectedSlot(),
         home = home, farm = farmInfo, dumps = dumps, inv = invList(),
         redstone = redState(),
+        protected = #protectedPats,
         crafty = turtle.craft ~= nil,
         left = peripheral.getType("left"), right = peripheral.getType("right"),
     })
@@ -447,6 +481,13 @@ local function digBlock(dir)
     if scanned then
         local before = doInspect(dir)
         if before then addBlock(tx, ty, tz, before) end
+    end
+    -- protected blocks (base materials / storage) are never mined: inspect
+    -- first and refuse. Recorded on the map so the dashboard shows them.
+    local pname = doInspect(dir)
+    if isProtected(pname) then
+        if pname then addBlock(tx, ty, tz, pname) end
+        return false, "protected block: " .. pname
     end
     local ok, err = digFn(dir)()
     if ok then
@@ -563,7 +604,12 @@ local function move(dir, autoDig)
         elseif autoDig and err and
             tostring(err):lower():find("obstruct", 1, true) then
             -- CC reports a blocked path as "Movement obstructed"
-            digBlock(d)
+            local dug, derr = digBlock(d)
+            if not dug and derr and derr:find("protected", 1, true) then
+                -- base material / storage in the way: never mine it, and tell
+                -- the caller so navigation can detour instead of aborting
+                return false, derr
+            end
             checkStop()
             ensureFuel()
             ok, err = turtle[dir]()
@@ -952,6 +998,11 @@ local function runCmd(cmd, a)
         dirtyState = true
         return true, "scanned surroundings"
     end
+    if cmd == "setdigpolicy" then
+        -- live dig-policy update from the dashboard: a.protected is a list
+        applyDigPolicy(textutils.serializeJSON({ protected = a.protected or {} }))
+        return true, "protecting " .. #protectedPats .. " block(s)"
+    end
     if cmd == "setore" then
         -- live ore-policy reload from the dashboard: a.policy is the parsed
         -- ores.json object. Re-classify every known cell so targets and the
@@ -1324,6 +1375,72 @@ local function runCmd(cmd, a)
         end
         local tall = a.tall ~= false
         scanMode = a.scan or "walls"
+
+        -- DESCEND MODE: dig straight down from home in a shaft, mine the
+        -- walls at every level, then climb back to the surface and return to
+        -- home base. Ideal for deep ore hunting without wandering into the
+        -- void. Args: depth, shaftGap (mine cross-section every N levels).
+        if a.descend then
+            local depth = math.max(1, math.min(256, tonumber(a.depth) or 32))
+            local gap = math.max(1, math.min(16, tonumber(a.shaftGap) or 4))
+            local sx, sy, sz = pos.x, pos.y, pos.z
+            local startY = pos.y
+            local need = (depth + 4) * 2
+            if turtle.getFuelLevel() ~= "unlimited" and
+                    turtle.getFuelLevel() < need then
+                return false, string.format("need ~%d fuel, have %s", need,
+                    tostring(turtle.getFuelLevel()))
+            end
+            local function bagFull()
+                for s = 1, 16 do
+                    if not turtle.getItemDetail(s) then return false end
+                end
+                return true
+            end
+            -- dig down; at each level mine the 4 walls a little to expose ore
+            local dug = 0
+            for i = 1, depth do
+                checkStop()
+                if bagFull() then break end
+                if not move("down", true) then break end
+                dug = dug + 1
+                if i % gap == 0 then
+                    -- widen this level: peek + dig the 4 side cells
+                    local o = facing
+                    for t = 0, 3 do
+                        digBlock("front")
+                        turnRight()
+                    end
+                    while facing ~= o do turnLeft() end
+                    if scanMode ~= "off" then scanSides(true) end
+                end
+                flushBlocks()
+                dirtyState = true
+                status = "autoMine: descending " .. dug .. "/" .. depth
+            end
+            -- return to surface: climb the shaft back to the start height
+            status = "autoMine: ascending"
+            dirtyState = true
+            pcall(runCmd, "refuel", { min = (startY - pos.y) + 8 })
+            local okUp = pcall(goTo, sx, startY, sz)
+            if not okUp then
+                log("descend: could not climb back to surface", "warn")
+            end
+            -- then back to home base
+            status = "autoMine: returning home"
+            dirtyState = true
+            local hx, hy, hz = home.x, home.y, home.z
+            local okHome = pcall(goTo, hx, hy, hz)
+            scanMode = "off"
+            flushBlocks()
+            pushState()
+            if not okHome then
+                return false, "descend: reached surface but not home"
+            end
+            return true, string.format("descended %d, back at home %d,%d,%d",
+                dug, pos.x, pos.y, pos.z)
+        end
+
         local span = tonumber(a.span) or 15    -- half-width of the grid box
         if span < 1 then span = 1 elseif span > 64 then span = 64 end
         -- per-job overrides: a.priority = { ["diamond_ore"] = 99, ... }
@@ -1346,6 +1463,12 @@ local function runCmd(cmd, a)
                 if v then return v end
             end
             return oreWeight(n)
+        end
+        -- a peer or a protected block is transient: skip / defer, never abort
+        local function softBlock(em)
+            em = tostring(em)
+            return em:find("blocked by another turtle", 1, true) or
+                   em:find("protected", 1, true)
         end
         local steps = 0
         local fails = 0
@@ -1495,9 +1618,9 @@ local function runCmd(cmd, a)
                     addBlock(ox, oy, oz, "minecraft:air")
                 else
                     local em = tostring(errOre)
-                    -- a peer turtle is NEVER a fatal error: leave the target
-                    -- for a later pass instead of aborting the whole job
-                    if em:find("blocked by another turtle", 1, true) then
+                    -- a peer or protected block is NEVER fatal: leave the
+                    -- target for a later pass instead of aborting the job
+                    if softBlock(em) then
                         sleep(1)
                     else
                         oreTargets[bkey(ox, oy, oz)] = nil
@@ -1526,10 +1649,9 @@ local function runCmd(cmd, a)
                         fails = 0
                     else
                         local em = tostring(errM)
-                        if em:find("blocked by another turtle", 1, true) then
-                            -- a peer is transient: skip the cell, do NOT count
-                            -- it as a failure. A fleet sharing a home would
-                            -- otherwise collide 4x and abort into "error".
+                        if softBlock(em) then
+                            -- peer / protected block is transient: skip the
+                            -- cell, do NOT count it as a fatal failure.
                             advance()
                             sleep(0.5)
                         else
