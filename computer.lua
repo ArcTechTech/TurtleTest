@@ -15,7 +15,7 @@
 -- computercraft:computer_* blocks, and turtles only see left/right upgrades.
 -- No world interaction, no commands, no keys - just a 10s heartbeat so the
 -- server (which drops units after 20s of silence) keeps it online.
-local WS_URL = "wss://shakira-fairly-details-berlin.trycloudflare.com/computer"
+local WS_URL = "wss://organizing-moisture-edges-township.trycloudflare.com/computer"
 local TOKEN = "447004d3aa68ca41"
 
 local args = { ... }
@@ -271,7 +271,7 @@ local function refreshEndpoint()
     local u = body:match('local%s+WS_URL%s*=%s*"([^"]+)"')
     local t = body:match('local%s+TOKEN%s*=%s*"([^"]+)"')
     local changed = false
-    if u and u ~= "wss://shakira-fairly-details-berlin.trycloudflare.com/computer" and u ~= WS_URL then
+    if u and u ~= "wss://organizing-moisture-edges-township.trycloudflare.com/computer" and u ~= WS_URL then
         WS_URL = u
         changed = true
     end
